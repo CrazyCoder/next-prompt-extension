@@ -11,8 +11,9 @@
  *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
- * via `ctx.ui.setEditorText` — editor-independent. Any other key dismisses the
- * suggestion immediately; deleting back to empty re-arms the last suggestion
+ * via `ctx.ui.setEditorText` — editor-independent. Other input is checked after
+ * editor processing: entered text dismisses the suggestion, while focus and
+ * navigation keep it visible. Deleting back to empty re-arms the last suggestion
  * after `rearmDelayMs` (default 2000, no new model call). No suggestion while
  * streaming.
  *
@@ -1309,9 +1310,9 @@ export interface SuggestionState {
 	renderMode: RenderMode;
 	rearmDelayMs: number;
 	rearmTimer: ReturnType<typeof setTimeout> | undefined;
-	rearmCheckTimer: ReturnType<typeof setTimeout> | undefined;
+	editorCheckTimer: ReturnType<typeof setTimeout> | undefined;
 	/**
-	 * Bumped on every user interaction and every reset. Any in-flight compute
+	 * Bumped when editor text changes and on every reset. Any in-flight compute
 	 * whose captured generation no longer matches is discarded (F-08).
 	 */
 	inputGeneration: number;
@@ -1372,7 +1373,7 @@ function showSuggestion(
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
-	clearRearmCheckTimer(state);
+	clearEditorCheckTimer(state);
 	renderSuggestion(state);
 }
 
@@ -1383,7 +1384,7 @@ function showSuggestion(
  */
 function dismissSuggestion(state: SuggestionState): void {
 	clearRearmTimer(state);
-	clearRearmCheckTimer(state);
+	clearEditorCheckTimer(state);
 	if (state.suggestion) {
 		state.suggestion = "";
 		renderSuggestion(state);
@@ -1398,7 +1399,7 @@ function dismissSuggestion(state: SuggestionState): void {
 function clearSuggestion(state: SuggestionState | undefined): void {
 	if (!state) return;
 	clearRearmTimer(state);
-	clearRearmCheckTimer(state);
+	clearEditorCheckTimer(state);
 	state.inputGeneration += 1;
 	if (state.suggestion) {
 		state.suggestion = "";
@@ -1414,31 +1415,39 @@ function clearRearmTimer(state: SuggestionState): void {
 	}
 }
 
-function clearRearmCheckTimer(state: SuggestionState): void {
-	if (state.rearmCheckTimer !== undefined) {
-		clearTimeout(state.rearmCheckTimer);
-		state.rearmCheckTimer = undefined;
+function clearEditorCheckTimer(state: SuggestionState): void {
+	if (state.editorCheckTimer !== undefined) {
+		clearTimeout(state.editorCheckTimer);
+		state.editorCheckTimer = undefined;
 	}
 }
 
 /**
- * After a delete-to-empty transition, re-arm the last suggestion after
- * rearmDelayMs (no new model call). Only a genuine non-empty -> empty
- * transition arms the timers (F-09); dismissal via Escape/arrows/focus never
- * does. The 50ms outer timer defers until the editor has processed the key.
+ * Inspect editor text after the focused component has processed raw input.
+ * Empty -> non-empty is genuine typing and dismisses the suggestion; terminal
+ * focus, mouse, navigation, and modifier sequences leave an empty editor and
+ * therefore keep it visible. Non-empty -> empty re-arms the cached suggestion
+ * after rearmDelayMs (F-09). The 50ms delay follows pi's input dispatch.
  */
-function scheduleRearmCheck(
+function scheduleEditorCheck(
 	state: SuggestionState,
 	editorTextBefore: string,
 ): void {
-	clearRearmCheckTimer(state);
-	if (editorTextBefore.length === 0) return; // nothing to delete from
-	state.rearmCheckTimer = setTimeout(() => {
-		state.rearmCheckTimer = undefined;
+	clearEditorCheckTimer(state);
+	state.editorCheckTimer = setTimeout(() => {
+		state.editorCheckTimer = undefined;
+		const editorTextAfter = state.getEditorText();
+		if (editorTextBefore.length === 0) {
+			if (editorTextAfter.length === 0) return;
+			dismissSuggestion(state);
+			state.inputGeneration += 1;
+			state.abortInflight();
+			return;
+		}
 		if (state.suggestion) return; // already showing
 		if (!state.lastSuggestion) return; // nothing to re-arm with
 		if (!state.isIdleGetter()) return; // agent running
-		if (state.getEditorText().length > 0) return; // not empty
+		if (editorTextAfter.length > 0) return; // not empty
 		clearRearmTimer(state);
 		state.rearmTimer = setTimeout(() => {
 			state.rearmTimer = undefined;
@@ -1451,10 +1460,11 @@ function scheduleRearmCheck(
 }
 
 /**
- * Raw terminal-input handler. Accept key fills the editor; any other key
- * dismisses the active suggestion immediately (F-04), invalidates in-flight
- * work (F-08), and schedules a re-arm only for a genuine delete-to-empty
- * transition (F-09). Editor-independent via ctx.ui.onTerminalInput.
+ * Raw terminal-input handler. The accept key fills the editor immediately.
+ * Other input is passed through and checked after the editor processes it, so
+ * only a real text change dismisses the suggestion or invalidates in-flight
+ * work (F-04/F-08). A genuine delete-to-empty transition schedules a re-arm
+ * (F-09). Editor-independent via ctx.ui.onTerminalInput.
  */
 function makeInputHandler(
 	state: SuggestionState,
@@ -1473,26 +1483,32 @@ function makeInputHandler(
 			editorTextBefore.length === 0
 		) {
 			// Accept: fill the editor, keep the suggestion cached for delete-to-empty
-			// re-arm, clear the widget, bump the input generation (invalidates any
-			// in-flight compute), and remember there is nothing to delete yet.
+			// re-arm, clear the widget, and invalidate any in-flight compute.
 			state.lastSuggestion = state.suggestion;
 			state.suggestion = "";
 			state.inputGeneration += 1;
 			clearRearmTimer(state);
-			clearRearmCheckTimer(state);
+			clearEditorCheckTimer(state);
 			state.abortInflight();
 			state.setEditorText(state.lastSuggestion);
 			state.publishWidget(undefined);
-			scheduleRearmCheck(state, editorTextBefore);
 			return { consume: true };
 		}
 
-		// Non-accept key: dismiss any active suggestion, abort in-flight work,
-		// and pass the key through to the editor.
+		// With an empty editor, wait until the focused component handles the raw
+		// bytes. Focus/mouse/navigation input leaves it empty and keeps the
+		// suggestion; typing or paste makes it non-empty and dismisses it.
+		if (editorTextBefore.length === 0) {
+			scheduleEditorCheck(state, editorTextBefore);
+			return undefined;
+		}
+
+		// Text already exists. Invalidate immediately and then check whether this
+		// input deleted back to empty so the cached suggestion can re-arm.
 		dismissSuggestion(state);
 		state.inputGeneration += 1;
 		state.abortInflight();
-		scheduleRearmCheck(state, editorTextBefore);
+		scheduleEditorCheck(state, editorTextBefore);
 		return undefined;
 	};
 }
@@ -1630,7 +1646,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			renderMode,
 			rearmDelayMs: effective.rearmDelayMs ?? DEFAULT_REARM_MS,
 			rearmTimer: undefined,
-			rearmCheckTimer: undefined,
+			editorCheckTimer: undefined,
 			inputGeneration: 0,
 			consentDialogDepth: 0,
 			isIdleGetter: () => ctx.isIdle(),

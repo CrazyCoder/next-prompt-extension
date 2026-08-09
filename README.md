@@ -10,9 +10,10 @@ most logical next instruction you'd type and shows it. Three render modes:
   editor is unfocused, e.g. after switching tabs/apps)
 - **`both`** — inline ghost AND the below-editor widget simultaneously
 
-Accept with **`Alt-/`** (default; configurable) to fill the input box. Any other key
-dismisses; backspace down to empty re-arms the last suggestion after a short delay (no
-new model call). No suggestion while streaming; the suggestion is cleared and any
+Accept with **`Alt-/`** (default; configurable) to fill the input box. The suggestion
+persists across terminal focus, mouse, and navigation input, and dismisses when editor
+text is entered; backspace down to empty re-arms the last suggestion after a short delay
+(no new model call). No suggestion while streaming; the suggestion is cleared and any
 in-flight model call aborted the instant you submit, start a turn, or the agent starts.
 
 ## Install
@@ -207,10 +208,10 @@ re-installs the editor once.
    (widget/both), via the inline ghost overlay (ghost/both), or both.
 4. The accept key is intercepted **before** the base editor: if a suggestion is
    showing, it fills the editor via `ctx.ui.setEditorText` and swallows the key.
-   Any other key dismisses the suggestion immediately (widget and ghost) and
-   delegates to the base editor; deleting back to empty re-arms the last suggestion
-   after `rearmDelayMs` (no new model call). Dismissing via Escape/arrows never
-   re-arms, and typing invalidates any in-flight suggestion request.
+   Other input is delegated to the base editor and checked afterward: focus, mouse,
+   Escape, and arrow sequences leave an empty editor and keep the suggestion visible;
+   entered text dismisses it and invalidates any in-flight request. Deleting back to
+   empty re-arms the last suggestion after `rearmDelayMs` (no new model call).
 
 ## Develop
 

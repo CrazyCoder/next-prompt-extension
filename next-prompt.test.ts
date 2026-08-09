@@ -1405,7 +1405,7 @@ describe("real pi-tui editor integration", () => {
 			renderMode: "ghost",
 			rearmDelayMs: 2000,
 			rearmTimer: undefined,
-			rearmCheckTimer: undefined,
+			editorCheckTimer: undefined,
 			inputGeneration: 0,
 			consentDialogDepth: 0,
 			isIdleGetter: () => true,
@@ -1558,6 +1558,7 @@ describe("real pi-tui editor integration", () => {
 	});
 
 	test("E6: terminal listeners run before focused editor input; consume stops the chain (F-13)", async () => {
+		vi.useFakeTimers();
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -1578,13 +1579,15 @@ describe("real pi-tui editor integration", () => {
 		expect(spyCalls).toBe(0);
 		expect(fake.editor.getText()).toBe("");
 		expect(fake.editorText).toBe("accept me");
-		// Non-accept key: our handler dismisses but does NOT consume → editor gets it.
+		// Non-accept key: our handler does NOT consume → editor gets it.
 		fake.deliverInput("x");
+		vi.advanceTimersByTime(50);
 		expect(spyCalls).toBe(1);
 		expect(fake.editor.getText()).toBe("x");
 	});
 
-	test("E7: conflicting acceptKey 'tab' is rejected and tab passes through unconsumed", async () => {
+	test("E7: rejected Tab accept key passes through without dismissing an empty editor", async () => {
+		vi.useFakeTimers();
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -1597,13 +1600,16 @@ describe("real pi-tui editor integration", () => {
 				stopReason: "stop",
 			},
 		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Config was rejected → hint shows the DEFAULT key, not Tab.
+		expect(fake.widgetContent?.[0] ?? "").toContain("sug");
 		expect(fake.widgetContent?.[0] ?? "").not.toContain("Tab to accept");
 		// Tab is never consumed and never fills the editor.
 		fake.deliverInput("\t");
+		vi.advanceTimersByTime(50);
 		expect(fake.editor.getText()).toBe("");
 		expect(fake.editorText).toBe("");
-		expect(fake.widgetContent).toBeUndefined(); // dismissed
+		expect(fake.widgetContent?.[0] ?? "").toContain("sug");
 	});
 
 	test("E8: lifecycle — reload/new/resume/fork keep exactly one listener per session and no duplicate installs", async () => {
@@ -1896,6 +1902,7 @@ function makeFake(opts: {
 				if (result?.consume) return;
 			}
 			editor.handleInput(data);
+			editorText = editor.getText();
 		},
 		get unsubInputCalls() {
 			return unsubInputCalls;
@@ -2252,12 +2259,8 @@ describe("acceptance / regression", () => {
 		expect(shouldTrigger([assistantEntry("a")], true, "typing")).toBe("skip");
 	});
 
-	test("T91: re-arm is transition-based — only delete-to-empty re-arms (controller-level)", async () => {
-		// The delete-to-empty re-arm is exercised end-to-end in the re-arm describe
-		// (T98+). This regression asserts Escape while a suggestion is showing does
-		// NOT re-arm, because dismissal is not a non-empty→empty transition.
+	test("T91: non-text terminal input keeps an empty-editor suggestion visible", async () => {
 		vi.useFakeTimers();
-		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -2266,9 +2269,11 @@ describe("acceptance / regression", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b"); // Escape dismisses
-		vi.advanceTimersByTime(150);
-		expect(fake.widgetContent).toBeUndefined(); // no re-arm
+		for (const input of ["\x1b[I", "\x1b[O", "\x1b", "\x1b[A"]) {
+			fake.inputHandler!(input);
+			vi.advanceTimersByTime(50);
+			expect(fake.widgetContent?.[0] ?? "").toContain("x");
+		}
 	});
 
 	test("T92: typing then submitting then settling → fresh suggestion computed (not stale)", async () => {
@@ -3145,7 +3150,8 @@ describe("cross-destination consent", () => {
 // ---------------------------------------------------------------------------
 
 describe("widget dismissal", () => {
-	test("W1: default widget mode clears the suggestion on a non-accept key", async () => {
+	test("W1: default widget mode clears after the editor receives text", async () => {
+		vi.useFakeTimers();
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -3155,8 +3161,27 @@ describe("widget dismissal", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
-		fake.inputHandler!("a"); // ordinary typing
-		expect(fake.widgetContent).toBeUndefined(); // dismissed immediately
+		fake.deliverInput("a");
+		expect(fake.editorText).toBe("a");
+		vi.advanceTimersByTime(50);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("W2: focus and navigation input do not clear an empty-editor suggestion", async () => {
+		vi.useFakeTimers();
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "suggestion text" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		for (const input of ["\x1b[I", "\x1b[O", "\x1b[A", "\x1b[C"]) {
+			fake.inputHandler!(input);
+			vi.advanceTimersByTime(50);
+			expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
+		}
 	});
 });
 
