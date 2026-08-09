@@ -1315,6 +1315,12 @@ export interface SuggestionState {
 	 * whose captured generation no longer matches is discarded (F-08).
 	 */
 	inputGeneration: number;
+	/**
+	 * Depth of extension-owned consent selectors currently consuming terminal
+	 * input. Their navigation/selection keys are not editor interactions and
+	 * must not invalidate the request that opened the selector.
+	 */
+	consentDialogDepth: number;
 	isIdleGetter: () => boolean;
 	getEditorText: () => string;
 	setEditorText: (text: string) => void;
@@ -1454,6 +1460,7 @@ function makeInputHandler(
 	state: SuggestionState,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
+		if (state.consentDialogDepth > 0) return undefined;
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
 			matchesAcceptKeyRaw(data, state.acceptKey);
@@ -1625,6 +1632,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			rearmTimer: undefined,
 			rearmCheckTimer: undefined,
 			inputGeneration: 0,
+			consentDialogDepth: 0,
 			isIdleGetter: () => ctx.isIdle(),
 			getEditorText: () => ctx.ui.getEditorText(),
 			setEditorText: (text) => ctx.ui.setEditorText(text),
@@ -1782,19 +1790,33 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				// Prefer the 3-option selector (allow once / always allow this
 				// provider pair / decline); fall back to a plain confirm dialog
 				// when the UI does not offer select.
+				const allowOnceLabel = "Allow once (this project)";
+				const alwaysLabel = "Always allow for this provider pair";
+				const declineLabel = "Decline";
 				let choice: string | undefined;
-				if (ctx.ui.select) {
-					choice = await ctx.ui.select(title, [
-						"Allow once (this project)",
-						"Always allow for this provider pair",
-						"Decline",
-					]);
-				} else {
-					const granted = await ctx.ui.confirm(
-						title,
-						`${detail} Allow for this project?`,
+				state.consentDialogDepth += 1;
+				try {
+					if (ctx.ui.select) {
+						choice = await ctx.ui.select(title, [
+							allowOnceLabel,
+							alwaysLabel,
+							declineLabel,
+						]);
+						if (choice === allowOnceLabel) choice = "once";
+						else if (choice === alwaysLabel) choice = "always";
+						else if (choice === declineLabel) choice = "decline";
+					} else {
+						const granted = await ctx.ui.confirm(
+							title,
+							`${detail} Allow for this project?`,
+						);
+						choice = granted ? "once" : "decline";
+					}
+				} finally {
+					state.consentDialogDepth = Math.max(
+						0,
+						state.consentDialogDepth - 1,
 					);
-					choice = granted ? "once" : "decline";
 				}
 				// F-08: the dialog may resolve AFTER an interaction, reset, or
 				// shutdown invalidated this request. Require the original

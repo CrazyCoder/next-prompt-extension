@@ -1407,6 +1407,7 @@ describe("real pi-tui editor integration", () => {
 			rearmTimer: undefined,
 			rearmCheckTimer: undefined,
 			inputGeneration: 0,
+			consentDialogDepth: 0,
 			isIdleGetter: () => true,
 			getEditorText: () => "",
 			setEditorText: () => {},
@@ -1667,7 +1668,7 @@ function makeFake(opts: {
 		| Promise<boolean>
 		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
-	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
+	/** Result for ctx.ui.select (consent chooser). Defaults to the first label. */
 	selectResult?: string | Promise<string> | (() => string | Promise<string>);
 	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
 	selectUnavailable?: boolean;
@@ -1785,7 +1786,7 @@ function makeFake(opts: {
 							const result =
 								typeof opts.selectResult === "function"
 									? opts.selectResult()
-									: (opts.selectResult ?? "once");
+									: (opts.selectResult ?? options[0]!);
 							return typeof result === "string" ? result : await result;
 						},
 					}),
@@ -2836,8 +2837,25 @@ describe("cross-destination consent", () => {
 		expect(consentsOnDisk()).toHaveLength(1);
 	});
 
+	test("C1b: consent selector input does not invalidate its own request", async () => {
+		let resolveSelect!: (value: string) => void;
+		const pending = new Promise<string>((resolve) => {
+			resolveSelect = resolve;
+		});
+		const { fake } = await setupCross({ selectResult: pending });
+		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
+
+		expect(fake.calls.selects).toHaveLength(1);
+		fake.inputHandler!("\r");
+		resolveSelect("Allow once (this project)");
+		await settle;
+
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(consentsOnDisk()).toHaveLength(1);
+	});
+
 	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
-		const { fake } = await setupCross({ selectResult: "decline" });
+		const { fake } = await setupCross({ selectResult: "Decline" });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
@@ -2963,7 +2981,9 @@ describe("cross-destination consent", () => {
 	});
 
 	test("C7: always-allow persists the directional pair to global config; no re-prompt afterwards", async () => {
-		const { fake } = await setupCross({ selectResult: "always" });
+		const { fake } = await setupCross({
+			selectResult: "Always allow for this provider pair",
+		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(1);
@@ -3050,16 +3070,16 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
-	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
+	test("F08a: consent resolved AFTER prompt submission → no grant, no complete (F-08)", async () => {
+		let resolveSelect!: (value: string) => void;
+		const pending = new Promise<string>((resolve) => {
+			resolveSelect = resolve;
 		});
 		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Ordinary typing while the dialog is pending bumps the input generation.
-		fake.deliverInput("x");
-		resolveConfirm("once"); // late approval
+		// A submitted prompt is a real interaction even while the selector is open.
+		fake.handlers.get("input")!({}, fake.ctx);
+		resolveSelect("Allow once (this project)"); // late approval
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
@@ -3077,7 +3097,7 @@ describe("cross-destination consent", () => {
 			{ type: "session_start", reason: "reload" },
 			fake.ctx,
 		);
-		resolveConfirm("once");
+		resolveConfirm("Allow once (this project)");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
@@ -3091,7 +3111,7 @@ describe("cross-destination consent", () => {
 		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		resolveConfirm("once");
+		resolveConfirm("Allow once (this project)");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
@@ -3110,9 +3130,9 @@ describe("cross-destination consent", () => {
 		// Second settle while the first dialog is pending aborts the first.
 		const second = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// User approves the SECOND dialog only; the first never resolves.
-		resolvers[resolvers.length - 1]!("once");
+		resolvers[resolvers.length - 1]!("Allow once (this project)");
 		await second;
-		resolvers[0]!("once"); // late approval on the aborted first dialog
+		resolvers[0]!("Allow once (this project)"); // late approval on the aborted first dialog
 		await first;
 		// The stale first settle must never disclose; only the second may
 		// complete (its own fresh request).
@@ -3145,12 +3165,17 @@ describe("widget dismissal", () => {
 // ---------------------------------------------------------------------------
 
 describe("atomic config writes", () => {
-	test("A1: saved config file has mode 0600 regardless of umask", () => {
+	test("A1: saved config is valid and has mode 0600 on POSIX", () => {
 		const dir = process.env.PI_CODING_AGENT_DIR!;
 		const path = `${dir}/next-prompt.json`;
 		saveConfig({ acceptKey: "ctrl+space" });
-		const mode = (statSync(path).mode & 0o777).toString(8);
-		expect(mode).toBe("600");
+		expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual({
+			acceptKey: "ctrl+space",
+		});
+		if (process.platform !== "win32") {
+			const mode = (statSync(path).mode & 0o777).toString(8);
+			expect(mode).toBe("600");
+		}
 	});
 	test("A2: saveConfig refuses a symlink destination", () => {
 		const dir = process.env.PI_CODING_AGENT_DIR!;
