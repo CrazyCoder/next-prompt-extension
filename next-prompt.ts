@@ -1739,15 +1739,7 @@ class GhostEditor extends CustomEditor {
 		// a mutable array to satisfy both hosts' base signatures.
 		const base = super.render(width).slice();
 		try {
-			// Ghost shows the suggestion plus the accept-key hint (mirroring
-			// the widget's "(Alt-/ to accept)"). The hint sits at the END of
-			// the ghost, so width truncation drops the hint first and keeps
-			// the suggestion.
-			const suggestion = this.suggestionState.suggestion;
-			const ghostText = suggestion
-				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
-				: suggestion;
-			return overlayGhost(base, ghostText, width);
+			return overlayGhost(base, this.suggestionState.suggestion, width);
 		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
