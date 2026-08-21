@@ -1538,10 +1538,9 @@ describe("real pi-tui editor integration", () => {
 			ed.handleInput("\x1b[D");
 		}
 		const lines = ed.render(40).join("\n");
-		// Cursor sits on the first grapheme: highlighted "a", then ghost (+
-		// accept-key hint), then "bc".
+		// Cursor sits on the first grapheme: highlighted "a", then ghost, then "bc".
 		expect(lines).toContain("\x1b[7ma\x1b[0m");
-		expect(lines).toContain("\x1b[2mghost  (Alt-/ to accept)\x1b[22mbc");
+		expect(lines).toContain("\x1b[2mghost\x1b[22mbc");
 		expect(ed.getText()).toBe("abc");
 	});
 
