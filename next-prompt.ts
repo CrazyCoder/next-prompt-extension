@@ -1,36 +1,52 @@
 /**
- * next-prompt — next-prompt suggestion extension for pi.
+ * next-prompt — next-prompt suggestion extension for pi and Oh My Pi (OMP).
  *
- * TUI-only (see F-03): when the input editor is empty after an agent turn has
- * fully settled, computes the single most logical next instruction the user
- * would type and shows it. Three render modes (config `renderMode`, default
- * "widget"):
+ * Interactive-only (see F-03): when the input editor is empty after an agent
+ * turn has fully settled, computes the single most logical next instruction
+ * the user would type and shows it. Three render modes (config `renderMode`,
+ * default "widget"):
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
+ * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
+ * failure there restores the default editor (Pi restores the captured prior
+ * owner), and another custom-editor extension installed first in the same OMP
+ * session is not detected (last installer wins).
  *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
- * via `ctx.ui.setEditorText` — editor-independent. Other input is checked after
- * editor processing: entered text dismisses the suggestion, while focus and
- * navigation keep it visible. Deleting back to empty re-arms the last suggestion
+ * via `ctx.ui.setEditorText` — editor-independent. Any other key dismisses the
+ * suggestion immediately; deleting back to empty re-arms the last suggestion
  * after `rearmDelayMs` (default 2000, no new model call). No suggestion while
  * streaming.
  *
  * Config (all optional), merged global + project. Project config is only
  * honored when the project is trusted, and global privacy settings
  * (`allowCrossProvider`, `maxTranscriptChars`) act as policy floors that
- * project config can tighten but never loosen:
- *   ~/.pi/agent/next-prompt.json
- *   <cwd>/.pi/next-prompt.json
+ * project config can tighten but never loosen. The config root comes from the
+ * host-provided CONFIG_DIR_NAME:
+ *   Pi global:  ~/.pi/agent/next-prompt.json        OMP global:  ~/.omp/agent/next-prompt.json
+ *   Pi project: <cwd>/.pi/next-prompt.json          OMP project: <cwd>/.omp/next-prompt.json
  *
  * Cross-destination disclosure (configured suggestion model on a different
  * provider/endpoint/model-route than the active model) is opt-in: it requires
  * `allowCrossProvider: true` (default false) AND explicit per-project consent,
- * persisted outside the repository in
- * `~/.pi/agent/next-prompt-consent.json`. Destination identity is provider +
- * endpoint origin + resolved model id, so a route/model change behind one
- * gateway never inherits consent (F-02/F-10).
+ * persisted outside the repository in the host agent dir as
+ * `next-prompt-consent.json`. Destination identity is provider + endpoint
+ * origin + resolved model id, so a route/model change behind one gateway never
+ * inherits consent (F-02/F-10).
+ *
+ * Host differences (see the compatibility boundary section):
+ *   - interactive check: Pi `ctx.mode === "tui"` vs OMP `ctx.hasUI === true`;
+ *   - completion lifecycle: Pi `agent_settled` vs OMP terminal `agent_end`
+ *     (skipped when `event.willContinue === true`);
+ *   - completion transport: Pi `modelRegistry.complete` vs OMP
+ *     `completeSimple` from the remapped legacy pi-ai module + the registry's
+ *     auth resolver;
+ *   - editor ownership: Pi can capture/restore `getEditorComponent()`; OMP has
+ *     no such API, hence the widget-only downgrade;
+ *   - project trust: Pi gates project config on `isProjectTrusted()`; OMP has
+ *     no project-trust API and follows the configuration loader default.
  *
  * @module next-prompt
  */
@@ -70,7 +86,6 @@ import type {
 	Context,
 	Message,
 	Model,
-	ThinkingLevel,
 	UserMessage,
 } from "@earendil-works/pi-ai";
 
@@ -84,6 +99,20 @@ export interface NextPromptModelConfig {
 }
 
 export type RenderMode = "widget" | "ghost" | "both";
+
+/**
+ * Reasoning/thinking level for the suggestion model. Defined locally (not
+ * imported from a host package) because Pi exports `ThinkingLevel` from
+ * `@earendil-works/pi-ai` while OMP's remapped pi-ai does not; the string
+ * values are identical on both hosts.
+ */
+export type ThinkingLevel =
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
@@ -652,6 +681,26 @@ export function pairAllowed(
 	return pairs.some(([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t);
 }
 
+/**
+ * Normalize the value returned by the real select dialog. Core pi returns the
+ * option label, but adapters/themes may add whitespace or ANSI styling; older
+ * test callers also used the symbolic values directly.
+ */
+export function consentChoiceFromLabel(
+	selected: unknown,
+): "once" | "always" | "decline" | undefined {
+	if (typeof selected !== "string") return undefined;
+	const normalized = stripAnsi(selected).trim().toLowerCase();
+	if (normalized === "once" || normalized.includes("allow once")) return "once";
+	if (
+		normalized === "always" ||
+		normalized.includes("always allow for this provider pair")
+	)
+		return "always";
+	if (normalized === "decline" || normalized.includes("decline")) return "decline";
+	return undefined;
+}
+
 /** Persist a consent grant atomically (best effort; never throws). */
 export function grantConsent(
 	project: string,
@@ -1199,6 +1248,37 @@ const DIM_START = "\x1b[2m";
 const DIM_END = "\x1b[22m";
 const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor
 
+/**
+ * Skip the editor's cursor representation starting at `i` (the position just
+ * past the CURSOR_MARKER): any ANSI sequences, then one visible code point.
+ * Pi renders the cursor as a `\x1b[7m…\x1b[0m` reverse-video block (located
+ * via CURSOR_BLOCK_END); OMP renders a plain theme glyph (`marker + glyph`,
+ * no trailing reset), so this fallback finds the insertion point after that
+ * glyph so the ghost lands between the cursor and any trailing text.
+ */
+function skipCursorRepresentation(line: string, i: number): number {
+	const n = line.length;
+	let j = i;
+	// Consume leading ANSI sequences (no visible width).
+	while (j < n) {
+		const c = line[j]!;
+		if (c === "\x1b") {
+			if (line[j + 1] === "[") {
+				// CSI: consume through the final byte (0x40..0x7E).
+				let k = j + 2;
+				while (k < n && (line.charCodeAt(k) < 0x40 || line.charCodeAt(k) > 0x7e)) k += 1;
+				j = Math.min(n, k + 1);
+				continue;
+			}
+			j = Math.min(n, j + 2); // ESC + one byte
+			continue;
+		}
+		break;
+	}
+	const next = Array.from(line.slice(j))[0];
+	return next ? j + next.length : j;
+}
+
 export function overlayGhost(
 	lines: string[],
 	ghost: string,
@@ -1249,27 +1329,26 @@ export function overlayGhost(
 
 	const line = result[cursorLineIdx]!;
 
-	// The cursor block is: <before><CURSOR_MARKER>\x1b[7m<grapheme or space>\x1b[0m<rest>
-	// Locate the first \x1b[0m after the CURSOR_MARKER to find the end of the cursor block.
+	// The cursor is: <before><CURSOR_MARKER><cursor block or glyph><rest>
+	// Locate the insertion point: Pi's reverse-video cursor block ends at the
+	// first \x1b[0m after the marker; OMP's plain theme glyph has no block, so
+	// skip one glyph after the marker instead.
 	const markerIdx = line.indexOf(CURSOR_MARKER);
 	if (markerIdx === -1) return lines; // defensive (already checked)
 	const cursorBlockEnd = line.indexOf(
 		CURSOR_BLOCK_END,
 		markerIdx + CURSOR_MARKER.length,
 	);
-	if (cursorBlockEnd === -1) return lines; // unexpected structure; leave unchanged
-	const insertAt = cursorBlockEnd + CURSOR_BLOCK_END.length;
+	const insertAt =
+		cursorBlockEnd !== -1
+			? cursorBlockEnd + CURSOR_BLOCK_END.length
+			: skipCursorRepresentation(line, markerIdx + CURSOR_MARKER.length);
 
-	// Compute the visible width of the line content (excluding ANSI + the marker) so we
-	// can size the ghost to fit within the editor content width without overflowing the
-	// border.
+	// Compute the visible width of the real content before the cursor (text +
+	// cursor glyph; ANSI and the marker stripped) so the ghost is sized to fit
+	// without overflowing the editor width.
 	const leftPart = line.slice(0, insertAt);
-	const trailingPart = line.slice(insertAt);
-	// Strip trailing whitespace (the padding the base editor appends) to measure real width.
-	const trailingTrimmed = trailingPart.replace(/\s+$/, "");
-	const leftVisible = visibleWidth(
-		stripAnsi(leftPart) + stripAnsi(trailingTrimmed),
-	);
+	const leftVisible = visibleWidth(stripAnsi(leftPart));
 	const remaining = Math.max(0, contentWidth - leftVisible);
 
 	const ghostSlice =
@@ -1279,14 +1358,21 @@ export function overlayGhost(
 	if (!ghostSlice) return lines; // nothing fits
 
 	const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
-	const newLine =
-		leftPart +
-		ghostStyled +
-		trailingTrimmed +
-		" ".repeat(
-			Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)),
-		);
-	result[cursorLineIdx] = newLine;
+	const ghostVisible = visibleWidth(ghostSlice);
+	// Preserve the line's exact width: remove ghostVisible cells from the
+	// padding adjacent to the cursor. Pi pads at the line end (`rest<pad>`);
+	// OMP pads right after the cursor, before the right border (`<pad>─╯`).
+	let tail = line.slice(insertAt);
+	const leadingPad = tail.match(/^\s+/)?.[0].length ?? 0;
+	if (leadingPad > 0) {
+		tail = tail.slice(Math.min(leadingPad, ghostVisible));
+	} else {
+		const trailingPad = tail.match(/\s+$/)?.[0].length ?? 0;
+		if (trailingPad > 0) {
+			tail = tail.slice(0, Math.max(0, tail.length - Math.min(trailingPad, ghostVisible)));
+		}
+	}
+	result[cursorLineIdx] = leftPart + ghostStyled + tail;
 	return result;
 }
 
@@ -1310,18 +1396,12 @@ export interface SuggestionState {
 	renderMode: RenderMode;
 	rearmDelayMs: number;
 	rearmTimer: ReturnType<typeof setTimeout> | undefined;
-	editorCheckTimer: ReturnType<typeof setTimeout> | undefined;
+	rearmCheckTimer: ReturnType<typeof setTimeout> | undefined;
 	/**
-	 * Bumped when editor text changes and on every reset. Any in-flight compute
+	 * Bumped on every user interaction and every reset. Any in-flight compute
 	 * whose captured generation no longer matches is discarded (F-08).
 	 */
 	inputGeneration: number;
-	/**
-	 * Depth of extension-owned consent selectors currently consuming terminal
-	 * input. Their navigation/selection keys are not editor interactions and
-	 * must not invalidate the request that opened the selector.
-	 */
-	consentDialogDepth: number;
 	isIdleGetter: () => boolean;
 	getEditorText: () => string;
 	setEditorText: (text: string) => void;
@@ -1336,6 +1416,15 @@ export interface SuggestionState {
 	fallbackToWidget: (() => void) | undefined;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
+	/**
+	 * Set by the global terminal-input listener for the current dispatch.
+	 * Custom editors consume this marker so they do not process the same key
+	 * twice, while still providing a fallback when OMP bypasses the global
+	 * listener during editor dispatch. The generation avoids a stale marker
+	 * suppressing a later identical key if another listener consumed the input.
+	 */
+	globalInputData?: string;
+	globalInputGeneration?: number;
 }
 
 /** Publish the below-editor widget (or clear it when there's no suggestion). */
@@ -1361,19 +1450,26 @@ function renderSuggestion(state: SuggestionState): void {
 /**
  * Show a suggestion. Guarded twice: the captured input generation must still
  * match (no intervening user interaction) and the editor must still be empty
- * and the agent idle (no submit/turn since the request started).
+ * (no submit/turn since the request started). The `checkIdle` render gate
+ * applies on Pi (agent_settled + real-time idle); OMP's compute path skips it
+ * because the terminal agent_end fires before the session unwinds — the
+ * generation/abort guards are its stale-result protection. The re-arm path
+ * always keeps the real-time idle gate (user-driven rendering while the agent
+ * is busy must not show).
  */
 function showSuggestion(
 	state: SuggestionState,
 	text: string,
 	generation: number,
+	checkIdle: boolean,
 ): void {
 	if (generation !== state.inputGeneration) return;
-	if (state.getEditorText().length > 0 || !state.isIdleGetter()) return;
+	if (state.getEditorText().length > 0) return;
+	if (checkIdle && !state.isIdleGetter()) return;
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
-	clearEditorCheckTimer(state);
+	clearRearmCheckTimer(state);
 	renderSuggestion(state);
 }
 
@@ -1384,7 +1480,7 @@ function showSuggestion(
  */
 function dismissSuggestion(state: SuggestionState): void {
 	clearRearmTimer(state);
-	clearEditorCheckTimer(state);
+	clearRearmCheckTimer(state);
 	if (state.suggestion) {
 		state.suggestion = "";
 		renderSuggestion(state);
@@ -1399,7 +1495,7 @@ function dismissSuggestion(state: SuggestionState): void {
 function clearSuggestion(state: SuggestionState | undefined): void {
 	if (!state) return;
 	clearRearmTimer(state);
-	clearEditorCheckTimer(state);
+	clearRearmCheckTimer(state);
 	state.inputGeneration += 1;
 	if (state.suggestion) {
 		state.suggestion = "";
@@ -1415,62 +1511,124 @@ function clearRearmTimer(state: SuggestionState): void {
 	}
 }
 
-function clearEditorCheckTimer(state: SuggestionState): void {
-	if (state.editorCheckTimer !== undefined) {
-		clearTimeout(state.editorCheckTimer);
-		state.editorCheckTimer = undefined;
+/**
+ * True when raw terminal input cannot possibly become editor text.
+ *
+ * Everything the user types is printable. Focus reports (ESC [ I / ESC [ O),
+ * mouse reports, arrow and navigation keys, and bare modifiers are ESC-prefixed
+ * sequences. Tab reaches here only when it is not the configured accept key, in
+ * which case the editor ignores it too.
+ *
+ * Deliberately conservative: anything unrecognized is treated as text, so a new
+ * sequence degrades to dismissing the suggestion rather than wrongly keeping a
+ * stale one over an editor the user has started filling.
+ */
+function isNonTextInput(data: string): boolean {
+	if (data.length === 0) return true;
+	if (data.startsWith("\x1b")) return true;
+	return data === "\t";
+}
+
+function clearRearmCheckTimer(state: SuggestionState): void {
+	if (state.rearmCheckTimer !== undefined) {
+		clearTimeout(state.rearmCheckTimer);
+		state.rearmCheckTimer = undefined;
 	}
 }
 
 /**
- * Inspect editor text after the focused component has processed raw input.
- * Empty -> non-empty is genuine typing and dismisses the suggestion; terminal
- * focus, mouse, navigation, and modifier sequences leave an empty editor and
- * therefore keep it visible. Non-empty -> empty re-arms the cached suggestion
- * after rearmDelayMs (F-09). The 50ms delay follows pi's input dispatch.
+ * After a delete-to-empty transition, re-arm the last suggestion after
+ * rearmDelayMs (no new model call). Only a genuine non-empty -> empty
+ * transition arms the timers (F-09); dismissal via Escape/arrows/focus never
+ * does. The 50ms outer check defers until the editor has processed the key,
+ * and re-polls for a bounded window (REARM_CHECK_POLLS) so a slow or
+ * chunked delete that has not finished emptying the editor at the first
+ * check still arms once it does — a one-shot check silently dropped the
+ * re-arm whenever the editor lagged past 50ms (observed on OMP with chunked
+ * terminal input).
  */
-function scheduleEditorCheck(
+const REARM_CHECK_INTERVAL_MS = 50;
+const REARM_CHECK_POLLS = 12; // ~600ms window for the editor to settle empty
+
+function scheduleRearmCheck(
 	state: SuggestionState,
 	editorTextBefore: string,
+	pollsLeft: number = REARM_CHECK_POLLS,
 ): void {
-	clearEditorCheckTimer(state);
-	state.editorCheckTimer = setTimeout(() => {
-		state.editorCheckTimer = undefined;
-		const editorTextAfter = state.getEditorText();
-		if (editorTextBefore.length === 0) {
-			if (editorTextAfter.length === 0) return;
-			dismissSuggestion(state);
-			state.inputGeneration += 1;
-			state.abortInflight();
-			return;
-		}
+	// Nothing to delete from. IMPORTANT: return BEFORE clearing the pending
+	// check — backspace auto-repeat (or a trailing delete burst) keeps firing
+	// events with an already-empty editor, and clearing here would cancel the
+	// check armed by the last real delete, silently dropping the re-arm.
+	if (editorTextBefore.length === 0) return;
+	clearRearmCheckTimer(state);
+	if (pollsLeft <= 0) return; // delete never settled empty; next key re-arms
+	state.rearmCheckTimer = setTimeout(() => {
+		state.rearmCheckTimer = undefined;
 		if (state.suggestion) return; // already showing
 		if (!state.lastSuggestion) return; // nothing to re-arm with
 		if (!state.isIdleGetter()) return; // agent running
-		if (editorTextAfter.length > 0) return; // not empty
+		const editorLen = state.getEditorText().length;
+		if (editorLen > 0) {
+			// Still deleting (or the editor is processing chunked input):
+			// re-check shortly; only a sustained non-empty state (the user is
+			// typing something new) stops the re-arm, and the next keystroke
+			// re-schedules anyway.
+			scheduleRearmCheck(state, state.getEditorText(), pollsLeft - 1);
+			return;
+		}
 		clearRearmTimer(state);
 		state.rearmTimer = setTimeout(() => {
 			state.rearmTimer = undefined;
 			if (state.suggestion) return;
 			if (!state.isIdleGetter()) return;
 			if (state.getEditorText().length > 0) return;
-			showSuggestion(state, state.lastSuggestion, state.inputGeneration);
+			showSuggestion(
+				state,
+				state.lastSuggestion,
+				state.inputGeneration,
+				true,
+			);
 		}, state.rearmDelayMs);
-	}, 50);
+	}, REARM_CHECK_INTERVAL_MS);
 }
 
+function isConsentDialogKey(data: string): boolean {
+	// Select/confirm dialogs use Enter, Escape, and CSI/SS3 navigation keys.
+	// Leave printable input untouched so an unrelated interaction still
+	// invalidates a pending consent request (F-08).
+	return (
+		data === "\r" ||
+		data === "\n" ||
+		data === "\x1b" ||
+		data.startsWith("\x1b[") ||
+		data.startsWith("\x1bO")
+	);
+}
 /**
- * Raw terminal-input handler. The accept key fills the editor immediately.
- * Other input is passed through and checked after the editor processes it, so
- * only a real text change dismisses the suggestion or invalidates in-flight
- * work (F-04/F-08). A genuine delete-to-empty transition schedules a re-arm
- * (F-09). Editor-independent via ctx.ui.onTerminalInput.
+ * Raw terminal-input handler. The same policy is also used by GhostEditor as
+ * an editor-local fallback because OMP versions can dispatch custom-editor
+ * input without invoking the extension's global listener.
  */
 function makeInputHandler(
 	state: SuggestionState,
+	isInputSuppressed: () => boolean = () => false,
+	recordGlobalInput = true,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
-		if (state.consentDialogDepth > 0) return undefined;
+		const markGlobalInput = () => {
+			if (!recordGlobalInput) return;
+			state.globalInputData = data;
+			state.globalInputGeneration = state.inputGeneration;
+		};
+
+		// Modal UI dialogs (such as the consent selector) own their navigation
+		// and confirmation keys. Do not treat those keys as editor input or
+		// invalidate the in-flight consent request.
+		if (isInputSuppressed() && isConsentDialogKey(data)) {
+			markGlobalInput();
+			return undefined;
+		}
+
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
 			matchesAcceptKeyRaw(data, state.acceptKey);
@@ -1483,32 +1641,50 @@ function makeInputHandler(
 			editorTextBefore.length === 0
 		) {
 			// Accept: fill the editor, keep the suggestion cached for delete-to-empty
-			// re-arm, clear the widget, and invalidate any in-flight compute.
+			// re-arm, clear the widget, bump the input generation (invalidates any
+			// in-flight compute), and remember there is nothing to delete yet.
 			state.lastSuggestion = state.suggestion;
 			state.suggestion = "";
 			state.inputGeneration += 1;
 			clearRearmTimer(state);
-			clearEditorCheckTimer(state);
+			clearRearmCheckTimer(state);
 			state.abortInflight();
 			state.setEditorText(state.lastSuggestion);
 			state.publishWidget(undefined);
+			scheduleRearmCheck(state, editorTextBefore);
 			return { consume: true };
 		}
 
-		// With an empty editor, wait until the focused component handles the raw
-		// bytes. Focus/mouse/navigation input leaves it empty and keeps the
-		// suggestion; typing or paste makes it non-empty and dismisses it.
-		if (editorTextBefore.length === 0) {
-			scheduleEditorCheck(state, editorTextBefore);
+		// Non-accept key: dismiss any active suggestion, abort in-flight work,
+		// and pass the key through to the editor. A delete key arriving on an
+		// already-empty editor (backspace auto-repeat / trailing delete burst)
+		// must NOT cancel a pending re-arm — dismissSuggestion clears the
+		// re-arm timers. Every other key (Escape, arrows, printable) still
+		// cancels a pending re-arm, preserving "dismissing never re-arms".
+		//
+		// A terminal delivers far more than keystrokes. Focus in/out reports,
+		// mouse reports, arrow keys and bare modifiers all arrive here, and over
+		// an EMPTY editor none of them can become text. Dismissing on those threw
+		// a suggestion away when the user merely alt-tabbed back to the terminal.
+		//
+		// Text arrives as printable bytes; the rest arrives ESC-prefixed, or as
+		// Tab when Tab is not the accept key. Classify rather than defer: the
+		// invalidation below has to stay synchronous, because a late consent
+		// approval is only fail-closed if the input that preceded it already
+		// bumped the generation. An unrecognized non-text byte simply falls
+		// through and dismisses, which is the behaviour without this branch.
+		if (editorTextBefore.length === 0 && isNonTextInput(data)) {
+			markGlobalInput();
 			return undefined;
 		}
 
-		// Text already exists. Invalidate immediately and then check whether this
-		// input deleted back to empty so the cached suggestion can re-arm.
-		dismissSuggestion(state);
+		const isDeleteKey =
+			data === "\x7f" || data === "\x08" || data === "\x1b[3~";
+		if (state.suggestion || !isDeleteKey) dismissSuggestion(state);
 		state.inputGeneration += 1;
+		markGlobalInput();
 		state.abortInflight();
-		scheduleEditorCheck(state, editorTextBefore);
+		scheduleRearmCheck(state, editorTextBefore);
 		return undefined;
 	};
 }
@@ -1524,8 +1700,8 @@ export const SYSTEM_PROMPT = `You predict the single most logical next instructi
 // ---------------------------------------------------------------------------
 // A render-only CustomEditor that overlays the current suggestion
 // (state.suggestion) as greyed inline text after the caret via overlayGhost().
-// Acceptance/dismissal is handled by the global onTerminalInput handler, so
-// this class never decides policy. Installed once per session; pi's
+// Acceptance/dismissal is normally handled by the global onTerminalInput
+// handler; GhostEditor repeats that policy only when OMP bypasses the listener.
 // resetExtensionUI on reload/switch is followed by a fresh session_start that
 // re-installs it (no per-settle re-installation — F-05).
 
@@ -1538,6 +1714,12 @@ class GhostEditor extends CustomEditor {
 		state: SuggestionState,
 	) {
 		super(tui, theme, keybindings);
+		// Capture the host TUI directly. Pi's CustomEditor sets `this.tui` in
+		// its own constructor; OMP's CustomEditor captures it only via an
+		// `instanceof` probe that can miss depending on module identity —
+		// without it, requestGhostRender silently no-ops and the ghost never
+		// repaints after a re-arm.
+		this.tui = tui;
 		this.suggestionState = state;
 	}
 
@@ -1552,9 +1734,20 @@ class GhostEditor extends CustomEditor {
 	}
 
 	render(width: number): string[] {
-		const base = super.render(width);
+		// `.slice()` normalizes the base render result: Pi returns a mutable
+		// `string[]`, OMP returns `readonly string[]`. The override must return
+		// a mutable array to satisfy both hosts' base signatures.
+		const base = super.render(width).slice();
 		try {
-			return overlayGhost(base, this.suggestionState.suggestion, width);
+			// Ghost shows the suggestion plus the accept-key hint (mirroring
+			// the widget's "(Alt-/ to accept)"). The hint sits at the END of
+			// the ghost, so width truncation drops the hint first and keeps
+			// the suggestion.
+			const suggestion = this.suggestionState.suggestion;
+			const ghostText = suggestion
+				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
+				: suggestion;
+			return overlayGhost(base, ghostText, width);
 		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
@@ -1565,14 +1758,192 @@ class GhostEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		// The global handler already dismissed/accepted; delegate everything to the
-		// base editor (autocomplete, history, paste, app keybindings) untouched.
+		// OMP normally runs the global listener before the focused editor. If
+		// that listener was bypassed, apply the same accept/dismiss policy here.
+		// A per-dispatch marker prevents duplicate handling when both paths run.
+		const globallyHandled =
+			this.suggestionState.globalInputData === data &&
+			this.suggestionState.globalInputGeneration === this.suggestionState.inputGeneration;
+		this.suggestionState.globalInputData = undefined;
+		this.suggestionState.globalInputGeneration = undefined;
+		if (!globallyHandled) {
+			const result = makeInputHandler(this.suggestionState, () => false, false)?.(data);
+			if (result?.consume) return;
+		}
 		super.handleInput(data);
 		this.tui?.requestRender();
 	}
 }
 
 export { GhostEditor };
+
+// ---------------------------------------------------------------------------
+// Host compatibility boundary (Pi vs Oh My Pi)
+// ---------------------------------------------------------------------------
+// All host differences live behind this boundary. Controller code consumes
+// the normalized helpers (`isInteractiveContext`, `projectTrustedForHost`,
+// the transport adapter) instead of raw host fields; every host-only property
+// is optional here, and type assertions exist only at this boundary.
+
+/** Runtime host the extension is running under. */
+export type HostKind = "pi" | "omp";
+
+/**
+ * Capabilities unique to the researched OMP `ExtensionAPI` shape: OMP injects
+ * its `pi` coding-agent exports and a TypeBox shim onto the API object; Pi's
+ * `ExtensionAPI` exposes neither. Detection is by capability — never by
+ * package name, version string, or environment — and happens exactly once per
+ * extension factory invocation.
+ */
+export function detectHost(api: unknown): HostKind {
+	const marker = api as { pi?: unknown; typebox?: unknown } | null | undefined;
+	return marker && (marker.typebox !== undefined || marker.pi !== undefined)
+		? "omp"
+		: "pi";
+}
+
+/** Minimal shape of the extension context the capability helpers read. */
+export interface HostContextLike {
+	mode?: unknown;
+	hasUI?: boolean;
+	isProjectTrusted?: () => boolean;
+}
+
+/**
+ * Whether this context is an interactive (TUI) session. Pi exposes `mode`
+ * (`"tui"` = full TUI); OMP exposes `hasUI` and no `mode`. An unknown context
+ * with neither field is conservatively non-interactive.
+ */
+export function isInteractiveContext(ctx: HostContextLike): boolean {
+	return "mode" in ctx && ctx.mode !== undefined
+		? ctx.mode === "tui"
+		: ctx.hasUI === true;
+}
+
+/**
+ * Whether the project is trusted for project-config loading. Pi exposes
+ * `isProjectTrusted()`; OMP has no project-trust API, so it follows the
+ * configuration loader's current default (trusted). OMP still enforces the
+ * global privacy floors and cross-destination consent — there is simply no
+ * host project-trust signal to consult.
+ */
+export function projectTrustedForHost(ctx: HostContextLike): boolean {
+	return typeof ctx.isProjectTrusted === "function"
+		? ctx.isProjectTrusted()
+		: true;
+}
+
+/**
+ * Narrow structural view of the extension context the controller consumes.
+ * Host-specific fields are optional; the compatibility helpers normalize them.
+ */
+export interface HostCtx extends HostContextLike {
+	cwd: string;
+	isIdle: () => boolean;
+	model: Model<Api> | undefined;
+	modelRegistry: {
+		find(provider: string, modelId: string): Model<Api> | undefined;
+		/** Pi completion transport (absent on OMP). */
+		complete?: (
+			model: Model<Api>,
+			context: Context,
+			options?: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+		) => Promise<AssistantMessage>;
+		/** OMP auth resolver (absent on Pi). */
+		resolver?: (model: Model<Api>) => unknown;
+		getAvailable?(): Array<{ provider: string; id: string; name?: string }>;
+	};
+	ui: {
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+		setWidget(
+			key: string,
+			content: string[] | undefined,
+			options?: { placement?: string },
+		): void;
+		getEditorText(): string;
+		setEditorText(text: string): void;
+		onTerminalInput(
+			handler: (data: string) => { consume?: boolean } | undefined,
+		): () => void;
+		/** Pi editor-owner getter (absent on OMP). */
+		getEditorComponent?: () => unknown;
+		setEditorComponent?: (
+			factory?:
+				| ((
+						tui: TUI,
+						theme: EditorTheme,
+						keybindings: KeybindingsManager,
+				  ) => unknown)
+				| undefined,
+		) => void;
+		select?: (
+			title: string,
+			options: string[],
+		) => Promise<string | undefined>;
+		confirm?: (title: string, message: string) => Promise<boolean>;
+		input?: (
+			title: string,
+			placeholder?: string,
+		) => Promise<string | undefined>;
+	};
+	sessionManager: { getBranch(): BranchEntry[] };
+	reload?: () => Promise<void>;
+}
+
+/**
+ * Narrow runtime view of OMP's completion surface, read from the lazily
+ * imported (and OMP-remapped) legacy `@earendil-works/pi-ai` module. Only the
+ * single function the extension consumes is declared; everything is typed
+ * structurally so no host-specific runtime import is ever required.
+ */
+export interface OmpCompletionModule {
+	completeSimple?: (
+		model: Model<Api>,
+		context: Context,
+		options?: {
+			apiKey?: unknown;
+			signal?: AbortSignal;
+			reasoning?: unknown;
+		},
+	) => Promise<AssistantMessage>;
+}
+
+let ompCompletionModuleOverride: (() => Promise<OmpCompletionModule>) | undefined;
+let ompCompletionModulePromise: Promise<OmpCompletionModule> | undefined;
+
+/**
+ * Lazy, cached access to OMP's completion module. The dynamic import only
+ * executes when the OMP branch actually completes a suggestion — Pi never
+ * requires or evaluates it. The promise is cached at module scope so repeated
+ * suggestions do not repeat module lookup/allocation; a load rejection is not
+ * cached so a transient failure can retry.
+ */
+function loadOmpCompletionModule(): Promise<OmpCompletionModule> {
+	if (!ompCompletionModulePromise) {
+		ompCompletionModulePromise = ompCompletionModuleOverride
+			? Promise.resolve().then(ompCompletionModuleOverride)
+			: import("@earendil-works/pi-ai").then(
+					(m) => m as unknown as OmpCompletionModule,
+					(err) => {
+						ompCompletionModulePromise = undefined;
+						throw err;
+					},
+				);
+	}
+	return ompCompletionModulePromise;
+}
+
+/**
+ * Test seam: replace the OMP completion-module loader. Passing `undefined`
+ * restores the real lazy import. Tests use this to make OMP completion
+ * deterministic and to assert Pi never touches the OMP transport.
+ */
+export function setOmpCompletionModuleForTests(
+	loader: (() => Promise<OmpCompletionModule>) | undefined,
+): void {
+	ompCompletionModuleOverride = loader;
+	ompCompletionModulePromise = undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Controller / event wiring
@@ -1585,6 +1956,7 @@ interface NextPromptRef {
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
+	const host = detectHost(pi);
 	const ref: NextPromptRef = {
 		state: undefined,
 		inflight: undefined,
@@ -1595,7 +1967,29 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Session-scoped denial set: a declined consent never re-prompts (nor
 	// sends) for the remainder of the session.
 	const deniedConsents = new Set<string>();
+	let consentDialogOpen = false;
 	let editorInstalled = false;
+	// Tracks a custom-editor install that OMP must reset itself (it has no
+	// host-side extension-UI teardown like Pi's resetExtensionUI).
+	let editorInstalledForHost = false;
+
+	// Boundary: register lifecycle events and the config command through a
+	// structural API view so the host-specific event names typecheck under
+	// both hosts' API contracts (Pi has `agent_settled`; OMP has only
+	// `agent_end`).
+	const api = pi as unknown as {
+		on(
+			event: string,
+			handler: (event: unknown, ctx: HostCtx) => unknown,
+		): void;
+		registerCommand(
+			name: string,
+			options: {
+				description?: string;
+				handler: (args: unknown, ctx: HostCtx) => unknown;
+			},
+		): void;
+	};
 
 	function reset(): void {
 		ref.inflight?.abort();
@@ -1603,7 +1997,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		clearSuggestion(ref.state);
 	}
 
-	pi.on("session_start", (_e, ctx) => {
+	api.on("session_start", (_e, ctx) => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
@@ -1611,16 +2005,32 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		editorInstalled = false;
 		deniedConsents.clear();
 
-		// F-03: no TUI => no invisible suggestion work in headless modes.
-		if (ctx.mode !== "tui") {
+		// F-03: no interactive UI => no invisible suggestion work in headless
+		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
+		if (!isInteractiveContext(ctx)) {
 			ref.state = undefined;
 			effective = undefined;
 			return;
 		}
 
-		// F-02: trust-gated, validated config with policy floors applied.
+		// OMP has no host-side extension-editor reset on session teardown (Pi
+		// clears extension UI on reset), so a GhostEditor we installed in a
+		// previous session would outlive it with a dead suggestion state.
+		// Restore the default editor before the new session's setup.
+		if (host === "omp" && editorInstalledForHost) {
+			try {
+				ctx.ui.setEditorComponent?.(undefined);
+			} catch {
+				// Best effort; a stale editor only affects rendering.
+			}
+			editorInstalledForHost = false;
+		}
+
+		// F-02: trust-gated, validated config with policy floors applied. OMP
+		// has no project-trust API, so projectTrustedForHost falls back to the
+		// loader default there.
 		effective = loadEffectiveConfig(ctx.cwd, {
-			projectTrusted: ctx.isProjectTrusted(),
+			projectTrusted: projectTrustedForHost(ctx),
 		});
 		if (effective.computeDisabled) {
 			ctx.ui.notify(
@@ -1646,9 +2056,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			renderMode,
 			rearmDelayMs: effective.rearmDelayMs ?? DEFAULT_REARM_MS,
 			rearmTimer: undefined,
-			editorCheckTimer: undefined,
+			rearmCheckTimer: undefined,
 			inputGeneration: 0,
-			consentDialogDepth: 0,
 			isIdleGetter: () => ctx.isIdle(),
 			getEditorText: () => ctx.ui.getEditorText(),
 			setEditorText: (text) => ctx.ui.setEditorText(text),
@@ -1666,7 +2075,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
-			const prior = ctx.ui.getEditorComponent();
+			// OMP has no getEditorComponent(): `prior` stays undefined there,
+			// so a fallback restores the DEFAULT editor (setEditorComponent
+			// with no factory) rather than a captured prior owner.
+			const prior = ctx.ui.getEditorComponent?.();
 			// P1-1: permanent, guarded fallback. First call wins; once we are in
 			// widget mode there is nothing left to fall back to, so later calls
 			// (e.g. from a stale GhostEditor instance) are no-ops.
@@ -1675,10 +2087,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				state.renderMode = "widget";
 				state.renderGhost = undefined;
 				editorInstalled = false;
+				editorInstalledForHost = false;
 				// Restore the previous owner (or the default editor) so the other
-				// extension's surface is not left half-replaced.
+				// extension's surface is not left half-replaced. `prior` is an
+				// opaque factory captured at the boundary and handed back
+				// verbatim; on OMP it is undefined and the default editor is
+				// restored.
 				try {
-					ctx.ui.setEditorComponent(prior ?? undefined);
+					ctx.ui.setEditorComponent?.(prior as never);
 				} catch {
 					// Restoration is best-effort; widget mode still works.
 				}
@@ -1690,7 +2106,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			};
 			state.fallbackToWidget = fallbackToWidget;
 			try {
-				ctx.ui.setEditorComponent((tui, theme, kb) => {
+				ctx.ui.setEditorComponent?.((tui, theme, kb) => {
 					const ed = new GhostEditor(tui, theme, kb, state);
 					state.renderGhost = () => {
 						try {
@@ -1702,6 +2118,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					return ed;
 				});
 				editorInstalled = true;
+				editorInstalledForHost = true;
 				if (prior) {
 					ctx.ui.notify(
 						"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
@@ -1717,38 +2134,83 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
-		ref.unsubInput = ctx.ui.onTerminalInput(makeInputHandler(state));
+		ref.unsubInput = ctx.ui.onTerminalInput(
+			makeInputHandler(state, () => consentDialogOpen),
+		);
 	});
 
-	pi.on("agent_settled", async (_e, ctx) => {
+	// Completion lifecycle by host:
+	//  - Pi: `agent_settled` is its fully-settled contract (fires once after
+	//    the agent is completely done).
+	//  - OMP: only terminal `agent_end` events (no `willContinue`) count —
+	//    continuations, automatic retries, and pending continuation turns
+	//    must never produce a suggestion. OMP has no `agent_settled`.
+	// There is exactly one computation gate: handleSettled().
+	if (host === "omp") {
+		api.on("agent_end", (event, ctx) => {
+			if ((event as { willContinue?: boolean } | undefined)?.willContinue === true) {
+				return;
+			}
+			return handleSettled(ctx);
+		});
+	} else {
+		api.on("agent_settled", (_e, ctx) => {
+			return handleSettled(ctx);
+		});
+	}
+
+	/**
+	 * Shared settled-turn handling. Guard order (unchanged from the Pi
+	 * controller): interactive context; session state and effective config
+	 * exist; config remains valid after reload; agent is idle; editor is
+	 * empty; then `maybeCompute` re-checks `shouldTrigger` before any request.
+	 */
+	/**
+	 * Shared settled-turn handling. Guard order:
+	 * interactive context; session state and effective config exist; config
+	 * remains valid after reload; agent is idle (Pi only — see below); editor
+	 * is empty; then `maybeCompute` re-checks `shouldTrigger` before any
+	 * request.
+	 *
+	 * Host difference: Pi's `agent_settled` fires when the agent is fully
+	 * idle, so the idle gate applies. OMP emits the terminal `agent_end`
+	 * BEFORE the session unwinds — `ctx.isIdle()` is still false at handler
+	 * time (verified live on OMP 17.2.13) — so on OMP the terminal event
+	 * itself (after the `willContinue` filter) is the settle signal and the
+	 * idle gate is skipped. Stale-output protection is unchanged: any user
+	 * interaction bumps the input generation and aborts the in-flight
+	 * request, and the render-time guards still apply on Pi.
+	 */
+	async function handleSettled(ctx: HostCtx): Promise<void> {
 		try {
-			if (ctx.mode !== "tui") return;
+			if (!isInteractiveContext(ctx)) return;
 			if (!ref.state || !effective) return;
-			// Re-read config so a mid-session edit takes effect on the next settle
-			// without a reload.
+			// Re-read config so a mid-session edit takes effect on the next
+			// settle/end without a reload.
 			effective = loadEffectiveConfig(ctx.cwd, {
-				projectTrusted: ctx.isProjectTrusted(),
+				projectTrusted: projectTrustedForHost(ctx),
 			});
 			if (effective.computeDisabled) return;
-			if (!ctx.isIdle() || ctx.ui.getEditorText().length > 0) return;
+			if (host === "pi" && !ctx.isIdle()) return;
+			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx);
 		} catch (err) {
-			console.warn("next-prompt: agent_settled handler failed", err);
+			console.warn("next-prompt: settled-turn handler failed", err);
 		}
-	});
+	}
 
 	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => {
+	api.on("input", () => {
 		reset();
 	});
-	pi.on("turn_start", () => {
+	api.on("turn_start", () => {
 		reset();
 	});
-	pi.on("agent_start", () => {
+	api.on("agent_start", () => {
 		reset();
 	});
 
-	pi.on("session_shutdown", () => {
+	api.on("session_shutdown", () => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
@@ -1756,7 +2218,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		effective = undefined;
 	});
 
-	async function maybeCompute(ctx: ExtensionContext): Promise<void> {
+	async function maybeCompute(ctx: HostCtx): Promise<void> {
 		if (!ref.state || !effective) return;
 		const state = ref.state;
 		ref.inflight?.abort();
@@ -1767,7 +2229,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (
 			shouldTrigger(
 				ctx.sessionManager.getBranch(),
-				ctx.isIdle(),
+				// Pi: agent_settled is the fully-idle contract. OMP: the
+				// terminal agent_end fires before the session unwinds, so the
+				// host event (already filtered for willContinue) is the settle
+				// signal — the idle check would always fail there.
+				host === "omp" ? true : ctx.isIdle(),
 				ctx.ui.getEditorText(),
 			) !== "compute"
 		) {
@@ -1795,8 +2261,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				) &&
 				!hasConsent(ctx.cwd, dest)
 			) {
-				// No dialogs at all -> fail closed.
-				if (!ctx.ui.select && !ctx.ui.confirm) return;
+				// No dialogs at all -> fail closed. Capture locals so the
+				// optional boundary fields narrow correctly below.
+				const { select, confirm } = ctx.ui;
+				if (!select && !confirm) return;
 				const transcriptSize = buildTranscript(
 					ctx.sessionManager.getBranch(),
 					effective,
@@ -1805,34 +2273,30 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
 				// Prefer the 3-option selector (allow once / always allow this
 				// provider pair / decline); fall back to a plain confirm dialog
-				// when the UI does not offer select.
+				// when the UI does not offer select. The selector returns the
+				// selected label, not an internal choice id.
 				const allowOnceLabel = "Allow once (this project)";
-				const alwaysLabel = "Always allow for this provider pair";
+				const alwaysAllowLabel = "Always allow for this provider pair";
 				const declineLabel = "Decline";
 				let choice: string | undefined;
-				state.consentDialogDepth += 1;
+				consentDialogOpen = true;
 				try {
-					if (ctx.ui.select) {
-						choice = await ctx.ui.select(title, [
+					if (select) {
+						const selected = await select(title, [
 							allowOnceLabel,
-							alwaysLabel,
+							alwaysAllowLabel,
 							declineLabel,
 						]);
-						if (choice === allowOnceLabel) choice = "once";
-						else if (choice === alwaysLabel) choice = "always";
-						else if (choice === declineLabel) choice = "decline";
-					} else {
-						const granted = await ctx.ui.confirm(
+						choice = consentChoiceFromLabel(selected);
+					} else if (confirm) {
+						const granted = await confirm(
 							title,
 							`${detail} Allow for this project?`,
 						);
 						choice = granted ? "once" : "decline";
 					}
 				} finally {
-					state.consentDialogDepth = Math.max(
-						0,
-						state.consentDialogDepth - 1,
-					);
+					consentDialogOpen = false;
 				}
 				// F-08: the dialog may resolve AFTER an interaction, reset, or
 				// shutdown invalidated this request. Require the original
@@ -1897,14 +2361,18 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			effective,
 		);
 		const messages = buildMessages(transcript);
-		const context: Context = {
-			systemPrompt: effective.systemPrompt ?? SYSTEM_PROMPT,
+		// Boundary: OMP's `Context.systemPrompt` is `string[]` (system-prompt
+		// lines), Pi's is a single `string`. Both hosts accept the same prompt
+		// text — OMP just wants it as an array. The cast is confined here.
+		const systemPrompt = effective.systemPrompt ?? SYSTEM_PROMPT;
+		const context = {
+			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
 			messages,
-		};
+		} as unknown as Context;
 
-		let resp: AssistantMessage;
+		let resp: AssistantMessage | undefined;
 		try {
-			resp = await ctx.modelRegistry.complete(resolved.model, context, {
+			resp = await completeSuggestion(host, ctx, resolved.model, context, {
 				signal: ac.signal,
 				reasoning: effective.thinking,
 			});
@@ -1915,6 +2383,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (ac.signal.aborted || generation !== state.inputGeneration) return;
+		if (resp === undefined) return; // transport unavailable; diagnostic already shown
 
 		if (resp.stopReason !== "stop") {
 			if (resp.stopReason === "error") {
@@ -1928,25 +2397,68 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
-		if (clean && ref.state === state) showSuggestion(state, clean, generation);
+		if (clean && ref.state === state)
+			showSuggestion(state, clean, generation, host === "pi");
 		if (ref.inflight === ac) ref.inflight = undefined;
+	}
+
+	/**
+	 * Host-specific completion transport.
+	 *  - Pi: `ctx.modelRegistry.complete(model, context, { signal, reasoning })`.
+	 *  - OMP: `completeSimple` from the lazily imported (and OMP-remapped)
+	 *    legacy `@earendil-works/pi-ai` module, invoked with the registry's
+	 *    auth resolver as `apiKey`. The module import is cached at module
+	 *    scope and never evaluated on Pi.
+	 * Returns `undefined` (with one controlled diagnostic) when OMP's
+	 * completion API is unavailable; transport errors propagate to the caller
+	 * (which reports a single error notification when the request was not
+	 * aborted).
+	 */
+	async function completeSuggestion(
+		hostKind: HostKind,
+		ctx: HostCtx,
+		model: Model<Api>,
+		context: Context,
+		options: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+	): Promise<AssistantMessage | undefined> {
+		if (hostKind === "pi") {
+			return ctx.modelRegistry.complete!(model, context, options);
+		}
+		const mod = await loadOmpCompletionModule();
+		if (!mod.completeSimple) {
+			ctx.ui.notify(
+				"next-prompt: OMP completion API unavailable; suggestions disabled",
+				"warning",
+			);
+			return undefined;
+		}
+		return mod.completeSimple(model, context, {
+			apiKey: ctx.modelRegistry.resolver?.(model),
+			signal: options.signal,
+			reasoning: options.reasoning,
+		});
 	}
 
 	// Interactive config command: `/next-prompt-config`. Walks the user through
 	// every configurable option EXCEPT systemPrompt (config-file only, F-15) with
-	// model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json, and reloads
-	// so changes take effect immediately.
-	pi.registerCommand("next-prompt-config", {
+	// model-picker + dialogs, saves to the host agent dir (`~/.pi/agent` on Pi,
+	// `~/.omp/agent` on OMP), and reloads so changes take effect immediately.
+	api.registerCommand("next-prompt-config", {
 		description: "Configure the next-prompt suggestion extension",
 		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") {
+			if (!isInteractiveContext(ctx)) {
 				ctx.ui.notify(
 					"next-prompt: /next-prompt-config requires interactive mode",
 					"error",
 				);
 				return;
 			}
-			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
+			// Boundary: the command context is interactive, so the optional
+			// dialog/model-list fields are present on both hosts.
+			const next = await configureInteractively(
+				ctx as unknown as Parameters<typeof configureInteractively>[0],
+				loadConfig(ctx.cwd),
+			);
 			if (next) {
 				const saved = saveConfig(next);
 				if (!saved.saved) {
@@ -1957,7 +2469,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				ctx.ui.notify("next-prompt: config saved — reloading", "info");
-				await ctx.reload();
+				await ctx.reload?.();
 			}
 		},
 	});
