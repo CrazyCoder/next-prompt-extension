@@ -22,22 +22,31 @@ text is entered; backspace down to empty re-arms the last suggestion after a sho
 (no new model call). No suggestion while streaming; the suggestion is cleared and any
 in-flight model call aborted the instant you submit, start a turn, or the agent starts.
 
+## About this fork
+
+This is a fork of [`@gamaraan/next-prompt`](https://www.npmjs.com/package/@gamaraan/next-prompt)
+by gamaraan, tracking upstream and adding one fix: a suggestion over an empty
+editor survives terminal focus, mouse and navigation input, instead of being
+dismissed when you switch back to the terminal.
+
+Install the upstream package instead if you do not need that.
+
 ## Install
 
 Pi and OMP auto-discover extensions from standard locations.
 
-### From npm / the pi package gallery
+### From npm / the pi package gallery (recommended)
 
-The published package is `@gamaraan/next-prompt`, published under the npm account `gamaraan`:
+The published package is `@jetserge/next-prompt`, published under the npm account `jetserge`:
 
 ```bash
-pi install npm:@gamaraan/next-prompt
+pi install npm:@jetserge/next-prompt
 ```
 
 A specific release can be pinned with:
 
 ```bash
-pi install npm:@gamaraan/next-prompt@0.1.0
+pi install npm:@jetserge/next-prompt@0.2.2
 ```
 
 ### OMP
@@ -46,13 +55,13 @@ Install through the OMP plugin manager (observed from `omp plugin --help` /
 `omp plugin install --dry-run`):
 
 ```bash
-omp plugin install npm:@gamaraan/next-prompt
+omp plugin install npm:@jetserge/next-prompt
 ```
 
 Pin a specific release the same way:
 
 ```bash
-omp plugin install npm:@gamaraan/next-prompt@0.1.0
+omp plugin install npm:@jetserge/next-prompt@0.2.2
 ```
 
 After installing, run `omp plugin doctor` and confirm zero plugin errors. The
@@ -62,16 +71,18 @@ separate OMP package.
 
 ### From GitHub
 
-The source repository is `gamaraan/next-prompt-extension`:
+Installing from source tracks `main` instead of a release, and clones the
+repository on every machine. Prefer npm above unless you want unreleased
+changes. The source repository is `CrazyCoder/next-prompt-extension`:
 
 ```bash
-pi install git:github.com/gamaraan/next-prompt-extension
+pi install git:github.com/CrazyCoder/next-prompt-extension
 ```
 
 To pin a GitHub release or commit, append the tag or commit reference:
 
 ```bash
-pi install git:github.com/gamaraan/next-prompt-extension@v0.1.0
+pi install git:github.com/CrazyCoder/next-prompt-extension@v0.2.2
 ```
 
 ### Manual — copy the file
@@ -330,8 +341,8 @@ session, and record the results.
 ## Design & development
 
 Source and design discussion live in the
-[GitHub repository](https://github.com/gamaraan/next-prompt-extension).
+[GitHub repository](https://github.com/CrazyCoder/next-prompt-extension).
 
 ## License
 
-MIT — see [LICENSE](https://github.com/gamaraan/next-prompt-extension/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/CrazyCoder/next-prompt-extension/blob/main/LICENSE).
