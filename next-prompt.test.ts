@@ -4663,3 +4663,210 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Step 1 quality regressions (Q-series)
+// ---------------------------------------------------------------------------
+// Contract tests for the suggestion-quality fix plan (ADVERSARIAL_FIX_PLAN.md).
+// These intentionally FAIL against the current implementation; each one pins
+// the observable behavior Steps 2–3 must deliver:
+//   Q1–Q2  maxRecentTurns counts user-led exchanges, not raw message entries
+//   Q3     an empty normalized transcript must never reach the model
+//   Q4     truncation respects whole-message boundaries and role labels
+//   Q5     compaction summaries are included, obsolete pre-compaction text is not
+//   Q6     OMP compute uses the terminal agent_end.messages snapshot
+//   Q7     bounded, redacted tool-outcome metadata is preserved
+//   Q8     malformed model output (sentinel variants, preambles, lists) never renders
+
+function toolUseAssistantEntry(): BranchEntry {
+	return {
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "internal reasoning" },
+				{ type: "toolCall", id: "t1", name: "read", arguments: {} },
+			],
+			stopReason: "toolUse",
+		},
+	};
+}
+
+function textlessStopAssistantEntry(): BranchEntry {
+	return {
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "internal reasoning" }],
+			stopReason: "stop",
+		},
+	};
+}
+
+describe("Step 1 quality regressions (Q-series)", () => {
+	test("Q1: maxRecentTurns keeps the latest user-led exchange, not raw message entries", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolResultEntry(),
+			userEntry("q2"),
+			toolUseAssistantEntry(),
+			assistantEntry("Fixed it."),
+		];
+		const out = buildTranscript(branch, { maxRecentTurns: 1 });
+		expect(out).toBe("User: q2\nAssistant: Fixed it.");
+	});
+
+	test("Q2: textless tool-use assistant messages never consume the turn cap", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolUseAssistantEntry(),
+			toolUseAssistantEntry(),
+			toolUseAssistantEntry(),
+			userEntry("q2"),
+			assistantEntry("Fixed it."),
+		];
+		const out = buildTranscript(branch, { maxRecentTurns: 2 });
+		expect(out).toBe(
+			"User: q1\nAssistant: a1\nUser: q2\nAssistant: Fixed it.",
+		);
+	});
+
+	test("Q3: empty normalized transcript triggers zero model calls (Pi)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxRecentTurns: 1 }),
+		);
+		const { fake } = await setup({
+			branch: [
+				userEntry("q1"),
+				assistantEntry("a1"),
+				textlessStopAssistantEntry(),
+			],
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("Q4a: truncation drops whole older messages instead of slicing mid-message", () => {
+		const branch = [userEntry("x".repeat(300)), userEntry("latest question")];
+		const out = buildTranscript(branch, { maxTranscriptChars: 50 });
+		expect(out).toBe("User: latest question");
+	});
+
+	test("Q4b: oversized newest message keeps its role label and marks truncation", () => {
+		const out = buildTranscript([userEntry("H".repeat(300))], {
+			maxTranscriptChars: 50,
+		});
+		expect(out.startsWith("User: ")).toBe(true);
+		expect(out).toContain("…");
+	});
+
+	test("Q5: compaction summary is included and obsolete pre-compaction text excluded", () => {
+		// Raw compaction entry shape (session format); BranchEntry widening lands in Step 2.
+		const compaction = {
+			type: "compaction",
+			summary: "Compacted: the user pivoted to the payments refactor",
+		} as unknown as BranchEntry;
+		const branch = [
+			userEntry("old task"),
+			assistantEntry("old answer"),
+			compaction,
+			userEntry("new task"),
+			assistantEntry("new answer"),
+		];
+		const out = buildTranscript(branch, {});
+		expect(out).toContain("payments refactor");
+		expect(out).toContain("User: new task");
+		expect(out).toContain("Assistant: new answer");
+		expect(out).not.toContain("old task");
+		expect(out).not.toContain("old answer");
+	});
+
+	test("Q6: OMP compute builds context from the terminal agent_end.messages snapshot, not a stale branch", async () => {
+		const { fake } = await setupOmp({
+			branch: [userEntry("old request"), assistantEntry("stale reply")],
+		});
+		await fake.handlers.get("agent_end")!(
+			{
+				type: "agent_end",
+				willContinue: false,
+				messages: [
+					{ role: "user", content: "current request" },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "final reply" }],
+						stopReason: "stop",
+					},
+				],
+			},
+			fake.ctx,
+		);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const sent = (fake.calls.ompComplete[0]!.messages[0] as {
+			content: Array<{ type: string; text?: string }>;
+		}).content[0]!.text;
+		expect(sent).toContain("current request");
+		expect(sent).toContain("final reply");
+		expect(sent).not.toContain("old request");
+		expect(sent).not.toContain("stale reply");
+	});
+
+	test("Q7: bounded redacted tool-outcome metadata is preserved in the transcript", () => {
+		// Raw toolResult shape with tool metadata; BranchEntry widening lands in Step 2.
+		const toolResult = {
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "bash",
+				isError: true,
+				content: [
+					{ type: "text", text: "FAIL-SECRET-MARKER huge failing output" },
+				],
+			},
+		} as unknown as BranchEntry;
+		const branch = [
+			userEntry("run the tests"),
+			toolResult,
+			assistantEntry("Tests are failing."),
+		];
+		const out = buildTranscript(branch, {});
+		expect(out).toContain("User: run the tests");
+		expect(out).toContain("Assistant: Tests are failing.");
+		expect(out.toLowerCase()).toContain("bash");
+		expect(out.toLowerCase()).toContain("error");
+		expect(out).not.toContain("FAIL-SECRET-MARKER");
+	});
+
+	test("Q8a: sentinel variants are rejected (NONE., none)", () => {
+		expect(sanitizeSuggestion("NONE.")).toBe("");
+		expect(sanitizeSuggestion("none")).toBe("");
+	});
+
+	test("Q8b: preamble, lists, and multi-candidate output are rejected", () => {
+		expect(sanitizeSuggestion("Here is the suggestion:\nRun the tests")).toBe(
+			"",
+		);
+		expect(sanitizeSuggestion("1. Run tests\n2. Commit changes")).toBe("");
+	});
+
+	test("Q8c: a single clean instruction is still accepted", () => {
+		expect(sanitizeSuggestion("Run the tests")).toBe("Run the tests");
+	});
+
+	test("Q8d: controller never renders preamble chatter from the model", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{ type: "text", text: "Here is the suggestion:\nRun the tests" },
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+});
