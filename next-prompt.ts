@@ -68,7 +68,6 @@ import {
 	CustomEditor,
 	getAgentDir,
 	type ExtensionAPI,
-	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -192,7 +191,18 @@ export type TriggerDecision = "compute" | "skip";
 /** Minimal shape of a session-branch entry we read. */
 export interface BranchEntry {
 	type: string;
-	message?: { role?: string; content?: unknown; stopReason?: string };
+	message?: {
+		role?: string;
+		content?: unknown;
+		stopReason?: string;
+		/** toolResult metadata — bounded disclosure: name + status only (F-06). */
+		toolName?: string;
+		isError?: boolean;
+		/** compactionSummary / branchSummary message text. */
+		summary?: unknown;
+	};
+	/** compaction / branch_summary entry text (session format). */
+	summary?: unknown;
 }
 
 /** Minimal shape of ctx used by resolveSuggestionModel / buildTranscript. */
@@ -934,50 +944,153 @@ function joinAssistantText(content: unknown): string {
 	return parts.join("");
 }
 
+interface TranscriptSegment {
+	line: string;
+	/** True when this line begins a user-led exchange (F-11 windowing). */
+	isExchangeStart: boolean;
+}
+
+/** Slice `count` code units from `start` without splitting a surrogate pair. */
+function safeSliceUnits(s: string, start: number, count: number): string {
+	if (count <= 0) return "";
+	let end = Math.min(s.length, start + count);
+	if (end > start && end < s.length) {
+		const c = s.charCodeAt(end - 1);
+		if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+	}
+	return s.slice(start, end);
+}
+
+/** Slice the last `count` code units without splitting a surrogate pair. */
+function safeTailUnits(s: string, count: number): string {
+	if (count <= 0) return "";
+	let start = Math.max(0, s.length - count);
+	if (start > 0 && start < s.length) {
+		const c = s.charCodeAt(start);
+		if (c >= 0xdc00 && c <= 0xdfff) start += 1;
+	}
+	return s.slice(start);
+}
+
 export function buildTranscript(
 	branch: BranchEntry[],
 	config: NextPromptConfig = {},
 ): string {
 	const max = config.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT;
-	const lines: string[] = [];
+	const segments: TranscriptSegment[] = [];
 
-	// F-11: user-configurable recent-turn selection. Only the last N user/
-	// assistant entries are counted; tool results between them stay in the
-	// kept slice but remain excluded from the output.
-	let entries: BranchEntry[] = branch;
-	if (typeof config.maxRecentTurns === "number") {
-		const n = Math.max(1, Math.floor(config.maxRecentTurns));
-		const messages = branch.filter(
-			(entry) =>
-				entry.type === "message" &&
-				(entry.message?.role === "user" || entry.message?.role === "assistant"),
-		);
-		if (messages.length > n) {
-			const startEntry = messages[messages.length - n];
-			if (startEntry) {
-				const startIdx = branch.indexOf(startEntry);
-				entries = startIdx > 0 ? branch.slice(startIdx) : branch;
-			}
+	// Compaction / branch summaries obsolete everything before them: the
+	// normalized context is the summary plus what came after it (Q5).
+	const addSummary = (text: unknown): void => {
+		if (typeof text !== "string" || text.length === 0) return;
+		segments.length = 0;
+		segments.push({ line: `Summary: ${text}`, isExchangeStart: false });
+	};
+
+	for (const entry of branch) {
+		if (entry.type === "compaction" || entry.type === "branch_summary") {
+			addSummary(entry.summary);
+			continue;
 		}
-	}
-
-	for (const entry of entries) {
 		if (entry.type !== "message" || !entry.message) continue;
 		const msg = entry.message;
 		const role = msg.role;
 		if (role === "user") {
 			const t = joinUserText(msg.content);
-			if (t) lines.push(`User: ${t}`);
+			if (t) segments.push({ line: `User: ${t}`, isExchangeStart: true });
 		} else if (role === "assistant") {
 			const t = joinAssistantText(msg.content);
-			if (t) lines.push(`Assistant: ${t}`);
+			if (t)
+				segments.push({ line: `Assistant: ${t}`, isExchangeStart: false });
+		} else if (role === "toolResult") {
+			// Bounded, content-free tool metadata (F-06/Q7): name + status only.
+			// ponytail: no result excerpts — add redacted excerpts only if the
+			// Step 3 quality corpus shows they are needed.
+			if (typeof msg.toolName === "string" && msg.toolName.length > 0) {
+				segments.push({
+					line: `Tool ${msg.toolName}: ${msg.isError ? "error" : "ok"}`,
+					isExchangeStart: false,
+				});
+			}
+		} else if (role === "compactionSummary" || role === "branchSummary") {
+			addSummary(msg.summary);
 		}
-		// toolResult skipped — verbose, low signal, may leak file contents.
+		// All other roles (thinking-only assistants, bashExecution, custom) are
+		// semantically empty for next-prompt prediction and contribute nothing.
 	}
 
-	let joined = redactSecrets(lines.join("\n"));
-	if (joined.length > max) joined = joined.slice(joined.length - max);
-	return joined;
+	// F-11 (revised): maxRecentTurns counts user-led exchanges — a user
+	// message plus everything up to the next one — not raw message entries,
+	// so tool-loop assistant turns never consume the budget (Q1/Q2).
+	let kept = segments;
+	if (typeof config.maxRecentTurns === "number") {
+		const n = Math.max(1, Math.floor(config.maxRecentTurns));
+		const starts: number[] = [];
+		for (let i = 0; i < kept.length; i++) {
+			if (kept[i]!.isExchangeStart) starts.push(i);
+		}
+		if (starts.length > n) {
+			kept = kept.slice(starts[starts.length - n]!);
+		}
+	}
+
+	// Whole-message budget: keep the newest complete lines; a line that does
+	// not fit is dropped whole, and an oversized newest line keeps its role
+	// label with head+tail and an explicit marker (Q4a/Q4b).
+	const budgeted: string[] = [];
+	let used = 0;
+	for (let i = kept.length - 1; i >= 0; i--) {
+		const line = kept[i]!.line;
+		const cost = line.length + (budgeted.length > 0 ? 1 : 0);
+		if (used + cost > max) {
+			if (budgeted.length === 0) {
+				const sep = line.indexOf(": ");
+				const prefix = sep === -1 ? "" : line.slice(0, sep + 2);
+				const body = sep === -1 ? line : line.slice(sep + 2);
+				const inner = Math.max(1, max - prefix.length - 1);
+				const headCount = Math.floor(inner / 2);
+				budgeted.unshift(
+					`${prefix}${safeSliceUnits(body, 0, headCount)}…${safeTailUnits(body, inner - headCount)}`,
+				);
+			}
+			break;
+		}
+		used += cost;
+		budgeted.unshift(line);
+	}
+	if (budgeted.length === 0) return "";
+	return redactSecrets(budgeted.join("\n"));
+}
+
+/** Wrap a host message into the entry shape the normalizer consumes. */
+function toBranchEntry(message: unknown): BranchEntry {
+	return { type: "message", message: message as BranchEntry["message"] };
+}
+
+/**
+ * Normalized context source for one request. OMP's terminal `agent_end`
+ * carries the authoritative completed-message snapshot (preferred, Q6).
+ * Pi reads the compaction-aware effective context; the raw branch is the
+ * last resort for hosts that expose neither.
+ */
+function sessionEntries(
+	ctx: HostCtx,
+	externalMessages?: unknown[],
+): BranchEntry[] {
+	if (externalMessages && externalMessages.length > 0) {
+		return externalMessages.map(toBranchEntry);
+	}
+	if (typeof ctx.sessionManager.buildSessionContext === "function") {
+		try {
+			const messages = ctx.sessionManager.buildSessionContext().messages;
+			if (Array.isArray(messages) && messages.length > 0) {
+				return messages.map(toBranchEntry);
+			}
+		} catch {
+			// Fall through to the raw branch.
+		}
+	}
+	return ctx.sessionManager.getBranch();
 }
 
 export function buildMessages(transcript: string): Message[] {
@@ -1851,7 +1964,11 @@ export interface HostCtx extends HostContextLike {
 			placeholder?: string,
 		) => Promise<string | undefined>;
 	};
-	sessionManager: { getBranch(): BranchEntry[] };
+	sessionManager: {
+		getBranch(): BranchEntry[];
+		/** Compaction-aware effective context (Pi exposes it; optional elsewhere). */
+		buildSessionContext?: () => { messages?: unknown[] };
+	};
 	reload?: () => Promise<void>;
 }
 
@@ -2113,10 +2230,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// There is exactly one computation gate: handleSettled().
 	if (host === "omp") {
 		api.on("agent_end", (event, ctx) => {
-			if ((event as { willContinue?: boolean } | undefined)?.willContinue === true) {
+			const e = event as
+				| { willContinue?: boolean; messages?: unknown[] }
+				| undefined;
+			if (e?.willContinue === true) {
 				return;
 			}
-			return handleSettled(ctx);
+			// The terminal event carries the authoritative completed-message
+			// snapshot; prefer it over the not-yet-unwound session branch (Q6).
+			return handleSettled(ctx, e?.messages);
 		});
 	} else {
 		api.on("agent_settled", (_e, ctx) => {
@@ -2146,7 +2268,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	 * interaction bumps the input generation and aborts the in-flight
 	 * request, and the render-time guards still apply on Pi.
 	 */
-	async function handleSettled(ctx: HostCtx): Promise<void> {
+	async function handleSettled(
+		ctx: HostCtx,
+		externalMessages?: unknown[],
+	): Promise<void> {
 		try {
 			if (!isInteractiveContext(ctx)) return;
 			if (!ref.state || !effective) return;
@@ -2158,7 +2283,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (effective.computeDisabled) return;
 			if (host === "pi" && !ctx.isIdle()) return;
 			if (ctx.ui.getEditorText().length > 0) return;
-			await maybeCompute(ctx);
+			await maybeCompute(ctx, externalMessages);
 		} catch (err) {
 			console.warn("next-prompt: settled-turn handler failed", err);
 		}
@@ -2183,7 +2308,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		effective = undefined;
 	});
 
-	async function maybeCompute(ctx: HostCtx): Promise<void> {
+	async function maybeCompute(
+		ctx: HostCtx,
+		externalMessages?: unknown[],
+	): Promise<void> {
 		if (!ref.state || !effective) return;
 		const state = ref.state;
 		ref.inflight?.abort();
@@ -2191,9 +2319,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.inflight = ac;
 		const generation = state.inputGeneration;
 
+		// One normalized context per request: the trigger check, disclosure
+		// sizing, and the completion all read the same source (Step 2).
+		// Pi: compaction-aware buildSessionContext(); OMP: the terminal
+		// agent_end.messages snapshot; raw branch as the last resort.
+		const sourceEntries = sessionEntries(ctx, externalMessages);
 		if (
 			shouldTrigger(
-				ctx.sessionManager.getBranch(),
+				sourceEntries,
 				// Pi: agent_settled is the fully-idle contract. OMP: the
 				// terminal agent_end fires before the session unwinds, so the
 				// host event (already filtered for willContinue) is the settle
@@ -2206,6 +2339,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
 		if (!resolved.model) return;
+		const transcript = buildTranscript(sourceEntries, effective);
+		// An empty normalized context has nothing to predict from — never
+		// call the model (Q3).
+		if (!transcript.trim()) return;
 
 		// F-02 / F-10: cross-destination disclosure requires explicit, persisted
 		// per-project consent. Fail closed on decline; never re-prompt in-session.
@@ -2230,10 +2367,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				// optional boundary fields narrow correctly below.
 				const { select, confirm } = ctx.ui;
 				if (!select && !confirm) return;
-				const transcriptSize = buildTranscript(
-					ctx.sessionManager.getBranch(),
-					effective,
-				).length;
+				const transcriptSize = transcript.length;
 				const title = "next-prompt: send transcript to another provider?";
 				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
 				// Prefer the 3-option selector (allow once / always allow this
@@ -2321,10 +2455,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		const transcript = buildTranscript(
-			ctx.sessionManager.getBranch(),
-			effective,
-		);
 		const messages = buildMessages(transcript);
 		// Boundary: OMP's `Context.systemPrompt` is `string[]` (system-prompt
 		// lines), Pi's is a single `string`. Both hosts accept the same prompt

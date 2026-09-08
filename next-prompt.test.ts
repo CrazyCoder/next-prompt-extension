@@ -1007,7 +1007,7 @@ describe("buildTranscript", () => {
 		const branch = [userEntry("line1\nline2")];
 		expect(buildTranscript(branch, {})).toBe("User: line1\nline2");
 	});
-	test("T32b: maxRecentTurns keeps only the last N message entries (F-11)", () => {
+	test("T32b: maxRecentTurns keeps the last N user-led exchanges (F-11)", () => {
 		const branch = [
 			userEntry("q1"),
 			assistantEntry("a1"),
@@ -1016,7 +1016,7 @@ describe("buildTranscript", () => {
 			assistantEntry("a2"),
 		];
 		const out = buildTranscript(branch, { maxRecentTurns: 2 });
-		expect(out).toBe("User: q2\nAssistant: a2");
+		expect(out).toBe("User: q1\nAssistant: a1\nUser: q2\nAssistant: a2");
 	});
 	test("T32c: maxRecentTurns larger than branch keeps everything (F-11)", () => {
 		const branch = [userEntry("q1"), assistantEntry("a1")];
@@ -1028,7 +1028,7 @@ describe("buildTranscript", () => {
 		const branch = [userEntry("q1"), assistantEntry("a1"), userEntry("q2")];
 		expect(buildTranscript(branch, { maxRecentTurns: 1 })).toBe("User: q2");
 	});
-	test("T32e: toolResult entries between kept messages stay excluded (F-11)", () => {
+	test("T32e: exchange window keeps its initiating user request (F-11)", () => {
 		const branch = [
 			userEntry("q1"),
 			assistantEntry("a1"),
@@ -1036,7 +1036,7 @@ describe("buildTranscript", () => {
 			userEntry("q2"),
 		];
 		expect(buildTranscript(branch, { maxRecentTurns: 2 })).toBe(
-			"Assistant: a1\nUser: q2",
+			"User: q1\nAssistant: a1\nUser: q2",
 		);
 	});
 	test("T32f: invalid maxRecentTurns in config fails closed (F-11)", () => {
@@ -4739,13 +4739,9 @@ describe("Step 1 quality regressions (Q-series)", () => {
 			"next-prompt.json",
 			JSON.stringify({ maxRecentTurns: 1 }),
 		);
-		const { fake } = await setup({
-			branch: [
-				userEntry("q1"),
-				assistantEntry("a1"),
-				textlessStopAssistantEntry(),
-			],
-		});
+		// Exchange semantics keep user-led windows, so the empty case is a
+		// branch whose only renderable tail is a textless assistant message.
+		const { fake } = await setup({ branch: [textlessStopAssistantEntry()] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
 	});
