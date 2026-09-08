@@ -54,6 +54,7 @@ import {
 	setOmpCompletionModuleForTests,
 	shouldTrigger,
 	suggestionCodePointCap,
+	suggestionMaxTokens,
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
@@ -657,7 +658,7 @@ describe("resolveSuggestionModel", () => {
 		expect(notifies).toHaveLength(1);
 	});
 
-	test("T14: allowCrossProvider=false + different destination returns ctx.model, no notify", () => {
+	test("T14: allowCrossProvider=false + different destination warns once, returns ctx.model", () => {
 		const active = { provider: "openai", id: "gpt" };
 		const notifies: string[] = [];
 		const ctx = makeCtx({
@@ -676,7 +677,9 @@ describe("resolveSuggestionModel", () => {
 			model: active,
 			crossDestination: false,
 		});
-		expect(notifies).toHaveLength(0);
+		// F-10: fallback is announced once instead of staying silent.
+		expect(notifies).toHaveLength(1);
+		expect(notifies[0]).toContain("different destination");
 	});
 
 	test("T15: allowCrossProvider=false + same destination returns configured model", () => {
@@ -1104,8 +1107,8 @@ describe("sanitizeSuggestion", () => {
 		expect(sanitizeSuggestion("```\nhi\n```", {})).toBe("hi");
 		expect(sanitizeSuggestion("```ts\nhi\n```", {})).toBe("hi");
 	});
-	test("T39: collapses internal newlines to single spaces", () => {
-		expect(sanitizeSuggestion("line1\nline2", {})).toBe("line1 line2");
+	test("T39: multi-line model output is rejected (strict single instruction)", () => {
+		expect(sanitizeSuggestion("line1\nline2", {})).toBe("");
 	});
 	test("T40: caps to maxSuggestionChars at grapheme boundary", () => {
 		expect(sanitizeSuggestion("abcdefgh", { maxSuggestionChars: 3 })).toBe(
@@ -1781,6 +1784,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			maxTokens?: number;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -1803,6 +1807,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			maxTokens?: number;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -1836,7 +1841,11 @@ function makeFake(opts: {
 			complete: async (
 				model: unknown,
 				context: { systemPrompt?: string; messages: unknown[] },
-				options?: { signal?: AbortSignal; reasoning?: string },
+				options?: {
+					signal?: AbortSignal;
+					reasoning?: string;
+					maxTokens?: number;
+				},
 			) => {
 				calls.complete.push({
 					model,
@@ -1844,6 +1853,7 @@ function makeFake(opts: {
 					messages: context.messages,
 					signal: options?.signal,
 					reasoning: options?.reasoning,
+					maxTokens: options?.maxTokens,
 				});
 				if (opts.completeError) throw opts.completeError;
 				return (
@@ -2078,6 +2088,7 @@ function makeOmpFake(opts: {
 			apiKey?: unknown;
 			signal?: AbortSignal;
 			reasoning?: unknown;
+			maxTokens?: unknown;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -2106,6 +2117,7 @@ function makeOmpFake(opts: {
 			apiKey?: unknown;
 			signal?: AbortSignal;
 			reasoning?: unknown;
+			maxTokens?: unknown;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -2141,6 +2153,7 @@ function makeOmpFake(opts: {
 						apiKey: options?.apiKey,
 						signal: options?.signal,
 						reasoning: options?.reasoning,
+						maxTokens: options?.maxTokens,
 					});
 					if (opts.completeSimpleError) throw opts.completeSimpleError;
 					return (
@@ -4865,4 +4878,159 @@ describe("Step 1 quality regressions (Q-series)", () => {
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Step 3: prediction behavior (prompt hierarchy, validation, caps, corpus)
+// ---------------------------------------------------------------------------
+
+describe("Step 3 prediction behavior", () => {
+	test("S1: system prompt carries the decision hierarchy and NONE sentinel", () => {
+		expect(SYSTEM_PROMPT).toContain("priority order");
+		expect(SYSTEM_PROMPT).toContain("NONE");
+		expect(SYSTEM_PROMPT).toContain("never a continuation");
+	});
+
+	test("S2: Pi transport receives a conservative maxTokens cap (F-09)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxSuggestionChars: 320 }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		// ceil(320/4)+8 = 88
+		expect(fake.calls.complete[0]!.maxTokens).toBe(88);
+	});
+
+	test("S3: OMP transport receives a conservative maxTokens cap (F-09)", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const cap = fake.calls.ompComplete[0]!.maxTokens as number;
+		expect(cap).toBeGreaterThan(15);
+		expect(cap).toBeLessThanOrEqual(512);
+	});
+
+	test("S4: suggestionMaxTokens bounds derive from maxSuggestionChars", () => {
+		expect(suggestionMaxTokens({})).toBe(68); // ceil(240/4)+8
+		expect(suggestionMaxTokens({ maxSuggestionChars: 10000 })).toBe(512);
+		expect(suggestionMaxTokens({ maxSuggestionChars: 1 })).toBe(16);
+	});
+
+	test("S5: single-line label prefix is stripped, instruction kept", () => {
+		expect(sanitizeSuggestion("Suggestion: run the linter", {})).toBe(
+			"run the linter",
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Suggestion quality corpus (deterministic, no network)
+// ---------------------------------------------------------------------------
+// Representative real-shaped transcripts and model outputs pinning the
+// quality contract; run in CI so regressions here block the build.
+
+describe("suggestion quality corpus (deterministic)", () => {
+	const toolResultMeta = (name: string, isError: boolean): BranchEntry => ({
+		type: "message",
+		message: {
+			role: "toolResult",
+			toolName: name,
+			isError,
+			content: [{ type: "text", text: "raw output that must never leak" }],
+		},
+	});
+	const compactionEntry = (summary: string): BranchEntry => ({
+		type: "compaction",
+		summary,
+	});
+
+	const transcriptCases: Array<{
+		name: string;
+		branch: BranchEntry[];
+		config?: NextPromptConfig;
+		includes: string[];
+		excludes?: string[];
+	}> = [
+		{
+			name: "tool-loop turn keeps user task, tool status, and final reply",
+			branch: [
+				userEntry("Fix the auth test"),
+				toolUseAssistantEntry(),
+				toolResultMeta("bash", true),
+				toolUseAssistantEntry(),
+				assistantEntry("Fixed."),
+			],
+			includes: [
+				"User: Fix the auth test",
+				"Tool bash: error",
+				"Assistant: Fixed.",
+			],
+			excludes: ["raw output that must never leak"],
+		},
+		{
+			name: "compacted session keeps summary and post-compaction exchange",
+			branch: [
+				userEntry("old task"),
+				assistantEntry("old answer"),
+				compactionEntry("Compacted: pivot to the payments refactor"),
+				userEntry("new task"),
+				assistantEntry("done"),
+			],
+			includes: [
+				"Summary: Compacted: pivot to the payments refactor",
+				"User: new task",
+				"Assistant: done",
+			],
+			excludes: ["old task", "old answer"],
+		},
+		{
+			name: "turn cap keeps only the latest user-led exchange",
+			branch: [
+				userEntry("q1"),
+				assistantEntry("a1"),
+				userEntry("q2"),
+				assistantEntry("a2"),
+			],
+			config: { maxRecentTurns: 1 },
+			includes: ["User: q2", "Assistant: a2"],
+			excludes: ["q1", "a1"],
+		},
+		{
+			name: "oversized final reply stays bounded with its role label",
+			branch: [
+				userEntry("explain the parser"),
+				assistantEntry("E".repeat(20000)),
+			],
+			config: { maxTranscriptChars: 2000 },
+			includes: ["Assistant: ", "…"],
+		},
+	];
+	for (const c of transcriptCases) {
+		test(`corpus transcript: ${c.name}`, () => {
+			const out = buildTranscript(c.branch, c.config ?? {});
+			for (const inc of c.includes) expect(out).toContain(inc);
+			for (const exc of c.excludes ?? []) expect(out).not.toContain(exc);
+		});
+	}
+
+	const outputCases: Array<[string, string]> = [
+		["Run the tests", "Run the tests"],
+		["NONE", ""],
+		["none.", ""],
+		["NONE!", ""],
+		["Here is the suggestion:\nRun the tests", ""],
+		["1. Run tests\n2. Commit changes", ""],
+		["Suggestion: run the linter", "run the linter"],
+		["- fix the bug", ""],
+		["", ""],
+		["   ", ""],
+	];
+	for (const [raw, expected] of outputCases) {
+		test(`corpus output: ${JSON.stringify(raw)} → ${JSON.stringify(expected)}`, () => {
+			expect(sanitizeSuggestion(raw, {})).toBe(expected);
+		});
+	}
 });
