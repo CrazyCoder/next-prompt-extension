@@ -1263,14 +1263,32 @@ export function sanitizeTerminalText(text: string): string {
 }
 
 /**
- * Conservative output-token cap derived from the visible-width suggestion
- * cap, so a disobedient model cannot burn latency/quota on output that will
- * be discarded anyway (F-09). ~4 chars/token plus a small formatting margin;
- * bounded to [16, 512].
+ * Reasoning/thinking tokens share the completion budget on OpenAI-compatible
+ * APIs, so the output cap must reserve headroom for them — otherwise a
+ * thinking model burns the whole budget before writing the instruction and
+ * the request exits with finish_reason "length" (and empty text).
+ */
+const THINKING_TOKEN_MARGINS: Record<ThinkingLevel | "unset", number> = {
+	unset: 512, // model default thinking state is unknown — assume it may reason
+	minimal: 64,
+	low: 256,
+	medium: 1024,
+	high: 2048,
+	xhigh: 4096,
+	max: 4096,
+};
+
+/**
+ * Conservative completion-token cap derived from the visible-width suggestion
+ * cap plus thinking-aware reasoning headroom (F-09). ~4 chars/token plus a
+ * small formatting margin; total bounded to [16, 8192]. A well-behaved model
+ * never pays for unused headroom — max_tokens is only an upper bound.
  */
 export function suggestionMaxTokens(config: NextPromptConfig): number {
 	const chars = config.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION;
-	return Math.min(512, Math.max(16, Math.ceil(chars / 4) + 8));
+	const base = Math.ceil(chars / 4) + 8;
+	const margin = THINKING_TOKEN_MARGINS[config.thinking ?? "unset"] ?? 512;
+	return Math.min(8192, Math.max(16, base + margin));
 }
 
 /**
@@ -1292,6 +1310,11 @@ export function suggestionCodePointCap(maxWidthChars: number): number {
  */
 function stripTrailingZeroWidth(s: string): string {
 	return s.replace(/(?:[\u200B-\u200D\u2060\uFE0F\u034F\u180E]|\p{M})+$/u, "");
+}
+
+/** Whether raw model output is a legitimate NONE sentinel (any casing/punctuation). */
+export function isSentinelOutput(raw: string): boolean {
+	return /^\s*none[.!?]*\s*$/i.test(raw);
 }
 
 export function sanitizeSuggestion(
@@ -1335,7 +1358,7 @@ export function sanitizeSuggestion(
 	}
 
 	// NONE sentinel (case-insensitive, optional terminal punctuation).
-	if (/^none[.!?]*$/i.test(s)) return "";
+	if (isSentinelOutput(s)) return "";
 
 	// One recognized label prefix ("Suggestion: ...") is chatter; keep the
 	// instruction that follows it.
@@ -2107,6 +2130,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Session-scoped denial set: a declined consent never re-prompts (nor
 	// sends) for the remainder of the session.
 	const deniedConsents = new Set<string>();
+	const shownDiagnostics = new Set<string>();
 	let consentDialogOpen = false;
 	let editorInstalled = false;
 	// Tracks a custom-editor install that OMP must reset itself (it has no
@@ -2142,6 +2166,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
 		notifiedFallback.value = false;
+		shownDiagnostics.clear();
 		editorInstalled = false;
 		deniedConsents.clear();
 
@@ -2376,6 +2401,17 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const ac = new AbortController();
 		ref.inflight = ac;
 		const generation = state.inputGeneration;
+		// One-shot per-session diagnostics: silent failure modes (truncation,
+		// rejected chatter) surface exactly once instead of never.
+		const notifyOnce = (
+			key: string,
+			message: string,
+			type: "info" | "warning" | "error",
+		): void => {
+			if (shownDiagnostics.has(key)) return;
+			shownDiagnostics.add(key);
+			ctx.ui.notify(message, type);
+		};
 
 		// One normalized context per request: the trigger check, disclosure
 		// sizing, and the completion all read the same source (Step 2).
@@ -2525,11 +2561,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		let resp: AssistantMessage | undefined;
 		try {
-		resp = await completeSuggestion(host, ctx, resolved.model, context, {
-			signal: ac.signal,
-			reasoning: effective.thinking,
-			maxTokens: suggestionMaxTokens(effective),
-		});
+			resp = await completeSuggestion(host, ctx, resolved.model, context, {
+				signal: ac.signal,
+				reasoning: effective.thinking,
+				maxTokens: suggestionMaxTokens(effective),
+			});
 		} catch (err) {
 			if (!ac.signal.aborted) {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
@@ -2542,6 +2578,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (resp.stopReason !== "stop") {
 			if (resp.stopReason === "error") {
 				ctx.ui.notify("next-prompt: suggestion model error", "warning");
+			} else if (resp.stopReason === "length") {
+				// Reasoning tokens share the completion budget on OpenAI-compatible
+				// APIs — a length stop means the budget was consumed before any
+				// instruction was written. Surface it once instead of silently
+				// producing no suggestion.
+				notifyOnce(
+					"length",
+					"next-prompt: suggestion truncated before output — reasoning consumed the completion budget (raise maxSuggestionChars or lower thinking)",
+					"warning",
+				);
 			}
 			return;
 		}
@@ -2551,8 +2597,19 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
-		if (clean && ref.state === state)
-			showSuggestion(state, clean, generation, host === "pi");
+		if (clean) {
+			if (ref.state === state)
+				showSuggestion(state, clean, generation, host === "pi");
+		} else if (raw.trim().length > 0 && !isSentinelOutput(raw)) {
+			// F-08 diagnostics: a non-empty, non-NONE reply that failed strict
+			// validation is provider chatter — surface it once instead of
+			// failing silently.
+			notifyOnce(
+				"rejected",
+				"next-prompt: suggestion model output rejected (not a single-line instruction)",
+				"warning",
+			);
+		}
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 

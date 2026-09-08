@@ -2485,7 +2485,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T79: complete returns stopReason length → no ghost", async () => {
+	test("T79: complete returns stopReason length → throttled warning, no ghost", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -2495,6 +2495,16 @@ describe("controller wiring (agent_settled)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				(n) => n[1] === "warning" && n[0].includes("truncated"),
+			),
+		).toBe(true);
+		// Throttled: a second settle does not repeat the diagnostic.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("truncated")),
+		).toHaveLength(1);
 	});
 
 	test("T80: complete returns stopReason error → notify warning, no ghost", async () => {
@@ -4234,7 +4244,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("what's next?");
 	});
 
-	test("C6: OMP length stop → no render, no notify", async () => {
+	test("C6: OMP length stop → no render, throttled warning", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleResult: {
@@ -4244,6 +4254,11 @@ describe("OMP completion transport (completeSimple)", () => {
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("truncated"),
+			),
+		).toBe(true);
 	});
 
 	test("C6b: OMP error stop → warning notify, no render", async () => {
@@ -4891,7 +4906,7 @@ describe("Step 3 prediction behavior", () => {
 		expect(SYSTEM_PROMPT).toContain("never a continuation");
 	});
 
-	test("S2: Pi transport receives a conservative maxTokens cap (F-09)", async () => {
+	test("S2: Pi transport receives a thinking-aware maxTokens cap (F-09)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -4900,29 +4915,71 @@ describe("Step 3 prediction behavior", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
-		// ceil(320/4)+8 = 88
-		expect(fake.calls.complete[0]!.maxTokens).toBe(88);
+		// ceil(320/4)+8 = 88, + unset-thinking margin 512 = 600
+		expect(fake.calls.complete[0]!.maxTokens).toBe(600);
 	});
 
-	test("S3: OMP transport receives a conservative maxTokens cap (F-09)", async () => {
+	test("S3: OMP transport receives a thinking-aware maxTokens cap (F-09)", async () => {
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		const cap = fake.calls.ompComplete[0]!.maxTokens as number;
 		expect(cap).toBeGreaterThan(15);
-		expect(cap).toBeLessThanOrEqual(512);
+		expect(cap).toBeLessThanOrEqual(8192);
 	});
 
-	test("S4: suggestionMaxTokens bounds derive from maxSuggestionChars", () => {
-		expect(suggestionMaxTokens({})).toBe(68); // ceil(240/4)+8
-		expect(suggestionMaxTokens({ maxSuggestionChars: 10000 })).toBe(512);
-		expect(suggestionMaxTokens({ maxSuggestionChars: 1 })).toBe(16);
+	test("S4: suggestionMaxTokens adds thinking-aware reasoning headroom", () => {
+		// base 68 + unset margin 512
+		expect(suggestionMaxTokens({})).toBe(580);
+		// base 88 + low margin 256
+		expect(suggestionMaxTokens({ maxSuggestionChars: 320, thinking: "low" })).toBe(
+			344,
+		);
+		// base 2508 + xhigh margin 4096
+		expect(
+			suggestionMaxTokens({ maxSuggestionChars: 10000, thinking: "xhigh" }),
+		).toBe(6604);
 	});
 
 	test("S5: single-line label prefix is stripped, instruction kept", () => {
 		expect(sanitizeSuggestion("Suggestion: run the linter", {})).toBe(
 			"run the linter",
 		);
+	});
+
+	test("S6: rejected non-NONE chatter warns once per session", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{ type: "text", text: "Here is the suggestion:\nRun the tests" },
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("rejected")),
+		).toHaveLength(1);
+		// Throttled: a second settle does not repeat the diagnostic.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("rejected")),
+		).toHaveLength(1);
+	});
+
+	test("S7: NONE output stays fully silent (normal outcome)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "NONE" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.calls.notifies).toHaveLength(0);
 	});
 });
 
