@@ -1763,6 +1763,8 @@ function makeFake(opts: {
 	mode?: string;
 	projectTrusted?: boolean;
 	hasPriorEditor?: boolean;
+	/** Distinctive prior-owner factory for composition tests (defaults to the legacy no-op). */
+	priorEditorFactory?: (tui: unknown, theme: unknown, kb: unknown) => unknown;
 	/** setEditorComponent throws on install (e.g. the owner rejects replacement). */
 	setEditorComponentThrows?: boolean;
 	/** The constructed GhostEditor's tui.requestRender throws (ghost render pipeline fails). */
@@ -1849,8 +1851,10 @@ function makeFake(opts: {
 	let editorComponentRestores = 0;
 	// pi-faithful ownership tracking: getEditorComponent returns whatever
 	// factory was last handed to setEditorComponent.
+	const priorFactoryRef: unknown =
+		opts.priorEditorFactory ?? PRIOR_EDITOR_FACTORY;
 	let currentEditorFactory: unknown = opts.hasPriorEditor
-		? PRIOR_EDITOR_FACTORY
+		? priorFactoryRef
 		: undefined;
 	let requestRenderCalls = 0;
 	let lastEditorComponent: unknown;
@@ -1956,7 +1960,7 @@ function makeFake(opts: {
 					editorComponentInstalled = false;
 					return;
 				}
-				if (factory === PRIOR_EDITOR_FACTORY) {
+				if (factory === priorFactoryRef) {
 					// Restore path (fallbackToWidget): the previous owner is back.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
@@ -2143,6 +2147,8 @@ function makeOmpFake(opts: {
 	editorComponentCalls: number;
 	/** Count of setEditorComponent(undefined) calls (default-editor restore). */
 	editorComponentRestores: number;
+	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
+	lastEditorComponent: unknown;
 } {
 	let idle = opts.idle ?? true;
 	let loaderCalls = 0;
@@ -2172,6 +2178,7 @@ function makeOmpFake(opts: {
 	> = [];
 	let unsubInputCalls = 0;
 	let widgetContent: string[] | undefined;
+	let lastEditorComponent: unknown;
 	const editor = makeStubEditor();
 	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
@@ -2284,13 +2291,14 @@ function makeOmpFake(opts: {
 					return;
 				}
 				editorComponentInstalled = true;
-				factory(
+				lastEditorComponent = factory(
 					{
 						requestRender: () => {
 							if (opts.requestRenderThrows) {
 								throw new Error("ghost render pipeline failed");
 							}
 						},
+						terminal: { rows: 24, cols: 80 },
 					} as unknown,
 					{ borderColor: (s: string) => s, selectList: {} } as unknown,
 					{ matches: () => false } as unknown,
@@ -2341,6 +2349,9 @@ function makeOmpFake(opts: {
 		},
 		get editor() {
 			return editor;
+		},
+		get lastEditorComponent() {
+			return lastEditorComponent;
 		},
 		calls,
 		handlers,
@@ -2423,6 +2434,111 @@ describe("controller wiring (agent_settled)", () => {
 			),
 		).toBe(true);
 		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("C15: ghost decorates the prior editor — prior renders beneath, keys and text delegate (Step 5)", async () => {
+		class DistinctiveEditor {
+			focused = true;
+			text = "";
+			inputs: string[] = [];
+			onSubmit?: (t: string) => void;
+			constructor(
+				_tui: unknown,
+				_theme: unknown,
+				_kb: unknown,
+			) {}
+			render(width: number): string[] {
+				// Distinctive content + a focused cursor line so overlayGhost
+				// has a real insertion point.
+				return [`PRIOR-HEADER-${width}`, `${CURSOR_MARKER}\x1b[7m \x1b[0m`];
+			}
+			handleInput(data: string): void {
+				this.inputs.push(data);
+			}
+			getText(): string {
+				return this.text;
+			}
+			getExpandedText(): string {
+				return this.text;
+			}
+			setText(t: string): void {
+				this.text = t;
+			}
+		}
+		const priorInstances: DistinctiveEditor[] = [];
+		const priorFactory = (tui: unknown, theme: unknown, kb: unknown) => {
+			const ed = new DistinctiveEditor(tui, theme, kb);
+			priorInstances.push(ed);
+			return ed;
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: priorFactory,
+			completeResult: {
+				content: [{ type: "text", text: "decorated suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// The ghost is installed ON TOP of the prior editor: the prior
+		// instance is constructed (not discarded) and stays live.
+		expect(priorInstances.length).toBeGreaterThan(0);
+		const prior = priorInstances[0]!;
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+			handleInput: (data: string) => void;
+			setText: (t: string) => void;
+			onSubmit?: (t: string) => void;
+		};
+		// Text handed to the top editor must land in the prior editor, not a
+		// private buffer of the decorator.
+		ed.setText("draft text");
+		expect(prior.text).toBe("draft text");
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Render composes: prior lines beneath + ghost suggestion on top.
+		const painted = ed.render(100).join("\n");
+		expect(painted).toContain("PRIOR-HEADER-100");
+		expect(painted).toContain("decorated suggestion");
+		// Keys reach the prior editor — its distinctive behavior survives.
+		ed.handleInput("z");
+		expect(prior.inputs).toContain("z");
+		// pi's callback wiring forwards to the prior editor.
+		const onSubmit = (): void => {};
+		ed.onSubmit = onSubmit;
+		expect(prior.onSubmit).toBe(onSubmit);
+		// Accept through the decorated editor still fills exactly once.
+		ed.handleInput("\x1b/");
+		expect(fake.editorText).toBe("decorated suggestion");
+	});
+
+	test("C16: prior editor construction fails → ghost falls back, prior owner restored (Step 5)", async () => {
+		const priorFactory = () => {
+			throw new Error("prior editor exploded");
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: priorFactory,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// Constructing the decorated prior failed: fall back to widget mode,
+		// restore the prior owner, and never leave the editor half-replaced.
+		expect(fake.editorComponentInstalled).toBe(false);
+		expect(fake.editorComponentRestores).toBe(1);
+		expect(
+			fake.calls.notifies.some(([m]) => m.includes("ghost rendering failed")),
+		).toBe(true);
 	});
 
 	test("T73: default model = ctx.model when config has no model block", async () => {
@@ -4693,6 +4809,34 @@ describe("OMP render downgrade (widget-only)", () => {
 		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
 		expect(fake.calls.ompComplete).toHaveLength(1); // no new model call
+	});
+
+	test("R8: OMP ghost render → immediate accept via editor dispatch fills exactly once (bypassed global listener)", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "run the checks" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+			handleInput: (data: string) => void;
+		};
+		// The ghost paints the suggestion immediately after the settle.
+		expect(ed.render(80).join("\n")).toContain("run the checks");
+		// OMP can dispatch custom-editor input WITHOUT the global terminal
+		// listener: the editor itself must apply the accept policy — exactly
+		// once, immediately after the render.
+		ed.handleInput("\x1b/");
+		expect(fake.editorText).toBe("run the checks");
 	});
 });
 
