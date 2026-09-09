@@ -1907,14 +1907,25 @@ class GhostEditor extends CustomEditor {
 		// repaints after a re-arm.
 		this.tui = tui;
 		this.suggestionState = state;
+		diag("ghost_ctor"); // TEMP diagnostic
+	}
+
+	// TEMP diagnostic: proves the tree's live editor is THIS instance — pi's
+	// getEditorText goes through getExpandedText on the active editor.
+	override getExpandedText(): string {
+		const t = super.getExpandedText();
+		if (this.suggestionState.suggestion) diag("ghost_alive", { n: t.length });
+		return t;
 	}
 
 	/** Public so the controller can trigger a re-render when the ghost value changes. */
 	requestGhostRender(): void {
+		diag("ghost_req", { tui: Boolean(this.tui) }); // TEMP diagnostic
 		try {
 			this.tui?.requestRender();
 		} catch {
 			// Render pipeline broken -> treat as a ghost failure (P1-1).
+			diag("ghost_req_throw"); // TEMP diagnostic
 			this.suggestionState.fallbackToWidget?.();
 		}
 	}
@@ -1933,11 +1944,24 @@ class GhostEditor extends CustomEditor {
 			const ghostText = suggestion
 				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
 				: suggestion;
-			return overlayGhost(base, ghostText, width);
-		} catch {
+			const out = overlayGhost(base, ghostText, width);
+			if (suggestion) {
+				// TEMP diagnostic: proves render sees the suggestion and the
+				// overlay actually changes the painted lines.
+				diag("ghost_render", {
+					w: width,
+					sugLen: suggestion.length,
+					baseN: base.length,
+					changed: out.some((l, i) => l !== base[i]),
+					hasMarker: base.some((l) => l.includes(CURSOR_MARKER)),
+				});
+			}
+			return out;
+		} catch (e) {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
 			// mode (restoring the previous editor owner).
+			diag("ghost_render_throw", { err: String(e).slice(0, 200) }); // TEMP diagnostic
 			this.suggestionState.fallbackToWidget?.();
 			return base;
 		}
