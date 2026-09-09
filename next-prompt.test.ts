@@ -5170,6 +5170,14 @@ describe("suggestion quality corpus (deterministic)", () => {
 			'Next input I need from you: **"execute core gameplay"** — that unblocks Phase B (B1 bird entity, B2 physics/input, B3 terrain mesh, B4 terrain-aware pipes, B5 collision/death, B6 scoring/states, B7 pause). Everything else stays blocked until then.',
 			'execute core gameplay',
 		],
+		// Live-observed (2026-09-09, flappy session): readiness meta-voice that
+		// REPORTS status to the user ('Ready for ...') instead of emitting the
+		// literal next prompt. The quoted directive inside wins (Gabi: expected
+		// exactly "execute verification").
+		[
+			'Ready for the **"execute verification"** gate (Phase D) whenever you want to run it.',
+			'execute verification',
+		],
 	];
 	for (const [raw, expected] of outputCases) {
 		test(`corpus output: ${JSON.stringify(raw)} → ${JSON.stringify(expected)}`, () => {
