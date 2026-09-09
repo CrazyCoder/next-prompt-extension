@@ -363,12 +363,28 @@ describe("destination identity", () => {
 		expect(pairAllowed([], "openai", "anthropic")).toBe(false);
 	});
 
-	test("P2: consent labels tolerate whitespace/ANSI and symbolic values", () => {
-		expect(consentChoiceFromLabel("once")).toBe("once");
-		expect(consentChoiceFromLabel("  Allow once (this project)  ")).toBe("once");
+	test("P2: consent labels tolerate whitespace/ANSI and symbolic values (Step 4 durations)", () => {
+		// Internal ids pass through; the legacy "once" id maps to the
+		// least-persistent duration (F-12: "allow once" never persists).
+		expect(consentChoiceFromLabel("request")).toBe("request");
+		expect(consentChoiceFromLabel("session")).toBe("session");
+		expect(consentChoiceFromLabel("project")).toBe("project");
+		expect(consentChoiceFromLabel("always")).toBe("always");
+		expect(consentChoiceFromLabel("decline")).toBe("decline");
+		expect(consentChoiceFromLabel("once")).toBe("request");
+		// Real selector labels (with ANSI/whitespace tolerance).
+		expect(consentChoiceFromLabel("  Allow this once  ")).toBe("request");
+		expect(consentChoiceFromLabel("Allow for this session")).toBe("session");
+		expect(consentChoiceFromLabel("Always allow (this project)")).toBe("project");
 		expect(
-			consentChoiceFromLabel("\x1b[36mAlways allow for this provider pair\x1b[0m"),
+			consentChoiceFromLabel(
+				"\x1b[36mAlways allow for this provider pair (global)\x1b[0m",
+			),
 		).toBe("always");
+		// Legacy pre-Step-4 label stays recognized.
+		expect(consentChoiceFromLabel("Always allow for this provider pair")).toBe(
+			"always",
+		);
 		expect(consentChoiceFromLabel(" Decline ")).toBe("decline");
 		expect(consentChoiceFromLabel(undefined)).toBeUndefined();
 	});
@@ -3380,19 +3396,25 @@ describe("cross-destination consent", () => {
 		}
 	}
 
-	test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
+	test("C1: allow-this-once is request-scoped → completes, discloses, persists NOTHING (F-12)", async () => {
 		const { fake } = await setupCross();
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.selects).toHaveLength(1);
-		// The dialog offers the three choices, always-allow second.
-		expect(fake.calls.selects[0]![1].join("|")).toContain(
-			"Always allow for this provider pair",
-		);
+		// Disclosure (F-11): destination + redacted transcript size in the title.
+		expect(fake.calls.selects[0]![0]).toContain("anthropic");
+		expect(fake.calls.selects[0]![0]).toMatch(/\d+ chars/);
+		// The dialog offers every duration, durable ones labeled accurately.
+		const options = fake.calls.selects[0]![1].join("|");
+		expect(options).toContain("Allow this once");
+		expect(options).toContain("Allow for this session");
+		expect(options).toContain("Always allow (this project)");
+		expect(options).toContain("Always allow for this provider pair");
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "anthropic",
 			id: "haiku",
 		});
-		expect(consentsOnDisk()).toHaveLength(1);
+		// Request duration: nothing persisted to the consent file.
+		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
@@ -3408,8 +3430,10 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
-	test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
-		const { fake } = await setupCross();
+	test("C3: project-duration grant persists → second settle does not re-prompt (F-02)", async () => {
+		const { fake } = await setupCross({
+			selectResult: "Always allow (this project)",
+		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
 		expect(consentsOnDisk()).toHaveLength(1);
@@ -3609,7 +3633,7 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.selects).toHaveLength(1);
 	});
 
-	test("C9: no select API → falls back to confirm dialog; grant → complete", async () => {
+	test("C9: no select API → falls back to confirm dialog; session-scoped grant → complete, nothing persisted", async () => {
 		const { fake } = await setupCross({
 			selectUnavailable: true,
 			confirmResult: true,
@@ -3618,7 +3642,8 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.selects).toHaveLength(0);
 		expect(fake.calls.confirms).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(1);
-		expect(consentsOnDisk()).toHaveLength(1);
+		// The confirm fallback grants the SESSION duration only (F-12).
+		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("C10: malformed allowCrossProviderPairs fails closed (no compute)", async () => {
@@ -3646,6 +3671,79 @@ describe("cross-destination consent", () => {
 		// Fail closed: no dialog, no compute.
 		expect(fake.calls.selects).toHaveLength(0);
 		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("C11: session-duration grant → no re-prompt this session, nothing persisted, re-prompts next session", async () => {
+		const { fake } = await setupCross({ selectResult: "session" });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(1);
+		// Same session: granted for the session, no second dialog.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
+		expect(consentsOnDisk()).toHaveLength(0);
+		// New session: the session grant is gone → re-prompt.
+		const { fake: fake2 } = await setupCross({ selectResult: "session" });
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.selects).toHaveLength(1);
+	});
+
+	test("C12: OMP (no host trust API) ignores project routing and cross-provider keys (F-13)", async () => {
+		const projectPath = "/tmp/.pi/next-prompt.json";
+		mkdirSync("/tmp/.pi", { recursive: true });
+		writeFileSync(
+			projectPath,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		try {
+			const { fake } = await setupOmp({
+				branch: [assistantEntry("a")],
+				model: { provider: "openai", id: "gpt" },
+				findModel: (p, m) =>
+					p === "anthropic" && m === "haiku"
+						? { provider: "anthropic", id: "haiku" }
+						: undefined,
+			});
+			await fake.handlers.get("agent_end")!({}, fake.ctx);
+			// The project file must not route the transcript anywhere: the
+			// active model is used and no consent dialog was silently skipped.
+			expect(fake.calls.ompComplete[0]!.model).toEqual({
+				provider: "openai",
+				id: "gpt",
+			});
+			expect(fake.calls.selects).toHaveLength(0);
+		} finally {
+			rmSync(projectPath, { force: true });
+		}
+	});
+
+	test("C13: project allowCrossProviderPairs can never authorize a destination (floor)", async () => {
+		const projectPath = "/tmp/.pi/next-prompt.json";
+		mkdirSync("/tmp/.pi", { recursive: true });
+		writeFileSync(
+			projectPath,
+			JSON.stringify({
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		try {
+			const { fake } = await setupCross();
+			await fake.handlers.get("agent_settled")!({}, fake.ctx);
+			// Pairs are global-only: the project grant is ignored, so the
+			// consent dialog appears instead of a silent send.
+			expect(fake.calls.selects).toHaveLength(1);
+			expect(fake.calls.complete[0]!.model).toEqual({
+				provider: "anthropic",
+				id: "haiku",
+			});
+		} finally {
+			rmSync(projectPath, { force: true });
+		}
 	});
 
 	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
