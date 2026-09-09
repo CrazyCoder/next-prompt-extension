@@ -1923,14 +1923,20 @@ class GhostEditor extends CustomEditor {
 		// repaints after a re-arm.
 		this.tui = tui;
 		this.suggestionState = state;
-		diag("ghost_ctor"); // TEMP diagnostic
+		// TEMP diagnostic: who invoked the factory?
+		diag("ghost_ctor", {
+			stack: (new Error().stack ?? "").replace(/\n/g, " | ").slice(0, 500),
+		});
 	}
 
 	// TEMP diagnostic: proves the tree's live editor is THIS instance — pi's
 	// getEditorText goes through getExpandedText on the active editor.
 	override getExpandedText(): string {
 		const t = super.getExpandedText();
-		if (this.suggestionState.suggestion) diag("ghost_alive", { n: t.length });
+		diag("ghost_alive", {
+			n: t.length,
+			sug: this.suggestionState.suggestion.length,
+		});
 		return t;
 	}
 
