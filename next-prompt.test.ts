@@ -2505,16 +2505,17 @@ describe("controller wiring (agent_settled)", () => {
 		const painted = ed.render(100).join("\n");
 		expect(painted).toContain("PRIOR-HEADER-100");
 		expect(painted).toContain("decorated suggestion");
-		// Keys reach the prior editor — its distinctive behavior survives.
-		ed.handleInput("z");
-		expect(prior.inputs).toContain("z");
+		// Accept through the decorated editor fills exactly once.
+		ed.handleInput("\x1b/");
+		expect(fake.editorText).toBe("decorated suggestion");
 		// pi's callback wiring forwards to the prior editor.
 		const onSubmit = (): void => {};
 		ed.onSubmit = onSubmit;
 		expect(prior.onSubmit).toBe(onSubmit);
-		// Accept through the decorated editor still fills exactly once.
-		ed.handleInput("\x1b/");
-		expect(fake.editorText).toBe("decorated suggestion");
+		// Keys reach the prior editor — its distinctive behavior survives.
+		// (This keypress also dismisses the accepted suggestion: correct.)
+		ed.handleInput("z");
+		expect(prior.inputs).toContain("z");
 	});
 
 	test("C16: prior editor construction fails → ghost falls back, prior owner restored (Step 5)", async () => {

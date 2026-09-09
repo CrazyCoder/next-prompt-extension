@@ -1744,15 +1744,37 @@ function renderSuggestion(state: SuggestionState): void {
  * always keeps the real-time idle gate (user-driven rendering while the agent
  * is busy must not show).
  */
+/**
+ * Shared render gate (Step 5): the settled/render/re-arm paths must apply
+ * exactly the same staleness, editor-busy, and idle predicates.
+ */
+function renderGate(
+	state: SuggestionState,
+	generation: number,
+	checkIdle: boolean,
+): "generation" | "editor-busy" | "not-idle" | undefined {
+	if (generation !== state.inputGeneration) return "generation";
+	if (state.getEditorText().length > 0) return "editor-busy";
+	if (checkIdle && !state.isIdleGetter()) return "not-idle";
+	return undefined;
+}
+
+/** Shared accept precondition: a suggestion is up, the agent idle, editor empty. */
+function canAcceptSuggestion(state: SuggestionState, editorTextBefore: string): boolean {
+	return (
+		Boolean(state.suggestion) &&
+		state.isIdleGetter() &&
+		editorTextBefore.length === 0
+	);
+}
+
 function showSuggestion(
 	state: SuggestionState,
 	text: string,
 	generation: number,
 	checkIdle: boolean,
 ): void {
-	if (generation !== state.inputGeneration) return;
-	if (state.getEditorText().length > 0) return;
-	if (checkIdle && !state.isIdleGetter()) return;
+	if (renderGate(state, generation, checkIdle) !== undefined) return;
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
@@ -1849,8 +1871,7 @@ function scheduleRearmCheck(
 		state.rearmTimer = setTimeout(() => {
 			state.rearmTimer = undefined;
 			if (state.suggestion) return;
-			if (!state.isIdleGetter()) return;
-			if (state.getEditorText().length > 0) return;
+			if (renderGate(state, state.inputGeneration, true) !== undefined) return;
 			showSuggestion(
 				state,
 				state.lastSuggestion,
@@ -1905,9 +1926,7 @@ function makeInputHandler(
 
 		if (
 			isAcceptKey &&
-			state.suggestion &&
-			state.isIdleGetter() &&
-			editorTextBefore.length === 0
+			canAcceptSuggestion(state, editorTextBefore)
 		) {
 			// Accept: fill the editor, keep the suggestion cached for delete-to-empty
 			// re-arm, clear the widget, bump the input generation (invalidates any
@@ -2042,6 +2061,174 @@ class GhostEditor extends CustomEditor {
 }
 
 export { GhostEditor };
+
+// ---------------------------------------------------------------------------
+// Decorated prior editor (Step 5 — editor coexistence)
+// ---------------------------------------------------------------------------
+// When another extension owns the editor (pi-powerline-footer installs its
+// editorFactory at session start), pi's tree is last-installer-wins: replacing
+// the component silently discards the other extension's editor behavior.
+// Instead, the ghost DECORATES the prior editor instance: the prior renders
+// beneath, every keystroke/text/callback is delegated to it, and the ghost
+// suggestion is overlaid on its render. The other extension stays live.
+
+/** Structural surface the decorated prior editor exposes (opaque to us). */
+interface PriorEditorLike {
+	focused?: boolean;
+	render(width: number): string[] | readonly string[];
+	handleInput(data: string): void;
+	getText(): string;
+	getExpandedText?: () => string;
+	setText(text: string): void;
+	getPaddingX?: () => number;
+	setPaddingX?: (padding: number) => void;
+	setAutocompleteMaxVisible?: (max: number) => void;
+	setAutocompleteProvider?: (provider: unknown) => void;
+	invalidate?: () => void;
+	onSubmit?: (text: string) => void;
+	onChange?: (text: string) => void;
+	onEscape?: () => void;
+	onCtrlD?: () => void;
+	onPasteImage?: () => void;
+	onExtensionShortcut?: (data: string) => boolean | undefined;
+}
+
+/** Callback properties forwarded from the decorator to the prior editor. */
+const FORWARDED_CALLBACKS = [
+	"onSubmit",
+	"onChange",
+	"onEscape",
+	"onCtrlD",
+	"onPasteImage",
+	"onExtensionShortcut",
+] as const;
+
+class DecoratingGhostEditor extends CustomEditor {
+	private suggestionState: SuggestionState;
+	private prior: PriorEditorLike;
+
+	constructor(
+		tui: TUI,
+		theme: EditorTheme,
+		keybindings: KeybindingsManager,
+		state: SuggestionState,
+		prior: unknown,
+	) {
+		super(tui, theme, keybindings);
+		this.tui = tui;
+		this.suggestionState = state;
+		this.prior = prior as PriorEditorLike;
+		// pi wires the app-level callbacks onto the TOP component after the
+		// factory returns — forward every assignment to the prior editor so
+		// its own dispatch path sees the host handlers.
+		for (const prop of FORWARDED_CALLBACKS) {
+			Object.defineProperty(this, prop, {
+				get: () => (this.prior as unknown as Record<string, unknown>)[prop],
+				set: (value: unknown) => {
+					(this.prior as unknown as Record<string, unknown>)[prop] = value;
+				},
+				configurable: true,
+			});
+		}
+	}
+
+	requestGhostRender(): void {
+		try {
+			this.tui?.requestRender();
+		} catch {
+			this.suggestionState.fallbackToWidget?.();
+		}
+	}
+
+	private syncFocus(): void {
+		this.prior.focused = this.focused;
+	}
+
+	render(width: number): string[] {
+		this.syncFocus();
+		let base: string[];
+		try {
+			// The prior editor renders beneath; the ghost overlays on top.
+			base = this.prior.render(width).slice();
+		} catch {
+			// The prior's own render failed — that is the other extension's
+			// failure, not ours: give up the editor slot (restore the prior
+			// factory) and surface the suggestion via the widget.
+			this.suggestionState.fallbackToWidget?.();
+			return [];
+		}
+		try {
+			const suggestion = this.suggestionState.suggestion;
+			const ghostText = suggestion
+				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
+				: suggestion;
+			return overlayGhost(base, ghostText, width);
+		} catch {
+			this.suggestionState.fallbackToWidget?.();
+			return base;
+		}
+	}
+
+		handleInput(data: string): void {
+		this.syncFocus();
+		// Same policy as GhostEditor: the global terminal listener normally
+		// runs first (Pi); if a dispatch bypasses it, apply the accept/dismiss
+		// policy here via the per-dispatch marker. Everything that still
+		// reaches the editor goes to the PRIOR editor — its distinctive
+		// behavior survives.
+		const globallyHandled =
+			this.suggestionState.globalInputData === data &&
+			this.suggestionState.globalInputGeneration ===
+				this.suggestionState.inputGeneration;
+		this.suggestionState.globalInputData = undefined;
+		this.suggestionState.globalInputGeneration = undefined;
+		if (!globallyHandled) {
+			const result = makeInputHandler(
+				this.suggestionState,
+				() => false,
+				false,
+			)?.(data);
+			if (result?.consume) return;
+		}
+		this.prior.handleInput(data);
+		this.tui?.requestRender();
+	}
+
+	override getText(): string {
+		return this.prior.getText();
+	}
+
+	override getExpandedText(): string {
+		return this.prior.getExpandedText?.() ?? this.prior.getText();
+	}
+
+	override setText(text: string): void {
+		this.prior.setText(text);
+	}
+
+	override getPaddingX(): number {
+		return this.prior.getPaddingX?.() ?? 0;
+	}
+
+	override setPaddingX(padding: number): void {
+		this.prior.setPaddingX?.(padding);
+	}
+
+	override setAutocompleteMaxVisible(max: number): void {
+		this.prior.setAutocompleteMaxVisible?.(max);
+	}
+
+	override setAutocompleteProvider(provider: unknown): void {
+		(
+			this.prior as { setAutocompleteProvider?: (p: unknown) => void }
+		).setAutocompleteProvider?.(provider);
+	}
+
+	override invalidate(): void {
+		super.invalidate();
+		this.prior.invalidate?.();
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Host compatibility boundary (Pi vs Oh My Pi)
@@ -2326,7 +2513,22 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		state.fallbackToWidget = fallbackToWidget;
 		const factory = (tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
-			const ed = new GhostEditor(tui, theme, kb, state);
+			// Step 5 (coexistence): when another editor owner exists (Pi),
+			// DECORATE it — construct the prior editor and overlay the ghost on
+			// its render, delegating input/text/callbacks so the other
+			// extension's behavior survives. Only a priorless slot (default
+			// editor) gets the plain ghost editor.
+			const priorEditor = prior
+				? (prior as unknown as (
+						tui: TUI,
+						theme: EditorTheme,
+						kb: KeybindingsManager,
+					) => unknown)(tui, theme, kb)
+				: undefined;
+			const ed =
+				priorEditor !== undefined && priorEditor !== null
+					? new DecoratingGhostEditor(tui, theme, kb, state, priorEditor)
+					: new GhostEditor(tui, theme, kb, state);
 			state.renderGhost = () => {
 				try {
 					ed.requestGhostRender();
