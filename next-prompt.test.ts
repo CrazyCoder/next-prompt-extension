@@ -1739,6 +1739,7 @@ function makeFake(opts: {
 	completeResult?: {
 		content: Array<{ type: "text"; text: string }>;
 		stopReason: string;
+		usage?: { output?: number; reasoning?: number };
 	};
 	completeError?: Error;
 	model?: { provider: string; id: string; baseUrl?: string };
@@ -2566,6 +2567,44 @@ describe("controller wiring (agent_settled)", () => {
 		expect(
 			fake.calls.notifies.filter((n) => n[0].includes("truncated")),
 		).toHaveLength(1);
+	});
+
+	test("T79b: length stop with reasoning tokens → warning reports thinking usage, drops stale advice (P2a)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "" }],
+				stopReason: "length",
+				usage: { output: 0, reasoning: 2417 },
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const w = fake.calls.notifies.find(
+			([m, t]) => t === "warning" && m.includes("truncated"),
+		);
+		expect(w).toBeDefined();
+		expect(w![0]).toContain("thinking");
+		expect(w![0]).toContain("2417");
+		expect(w![0]).not.toContain("lower thinking level");
+	});
+
+	test("T79c: length stop with zero reasoning → warning reports narration overrun (P2a)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "" }],
+				stopReason: "length",
+				usage: { output: 2125, reasoning: 0 },
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const w = fake.calls.notifies.find(
+			([m, t]) => t === "warning" && m.includes("truncated"),
+		);
+		expect(w).toBeDefined();
+		expect(w![0]).toContain("narration");
+		expect(w![0]).toContain("2125");
+		expect(w![0]).not.toContain("lower thinking level");
 	});
 
 	test("T80: complete returns stopReason error → notify warning, no ghost", async () => {

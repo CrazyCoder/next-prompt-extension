@@ -2631,15 +2631,23 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (resp.stopReason === "error") {
 				ctx.ui.notify("next-prompt: suggestion model error", "warning");
 			} else if (resp.stopReason === "length") {
-				// Reasoning tokens share the completion budget on OpenAI-compatible
-				// APIs — a length stop means the budget was consumed before any
-				// instruction was written. Surface it once instead of silently
-				// producing no suggestion.
-				notifyOnce(
-					"length",
-					"next-prompt: suggestion truncated before output — reasoning consumed the completion budget; try a lower thinking level for suggestions",
-					"warning",
-				);
+				// A length stop means the completion budget ran out before an
+				// instruction was written. Two distinct live causes (measured
+				// 2026-09-09 on GLM-5.3-Flash): reasoning tokens eating the cap at
+				// medium/high thinking, or zero-reasoning narration run-ons at
+				// low. Report the actual usage instead of guessing a cause, and
+				// never advise a thinking level (the live config may already be
+				// at the floor, where that advice is a no-op). Surface once.
+				const cap = suggestionMaxTokens(effective);
+				const out = resp.usage?.output ?? 0;
+				const reasoning = resp.usage?.reasoning ?? 0;
+				const message =
+					reasoning > 0
+						? `next-prompt: suggestion truncated — thinking consumed ${reasoning} of ${cap} completion tokens before any instruction was written`
+						: out > 0
+							? `next-prompt: suggestion truncated — the model wrote ${out} tokens of narration and hit the ${cap}-token cap before emitting an instruction`
+							: `next-prompt: suggestion truncated — the model hit the ${cap}-token completion cap before emitting an instruction`;
+				notifyOnce("length", message, "warning");
 			}
 			return;
 		}
