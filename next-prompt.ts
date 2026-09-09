@@ -1267,15 +1267,18 @@ export function sanitizeTerminalText(text: string): string {
  * APIs, so the output cap must reserve headroom for them — otherwise a
  * thinking model burns the whole budget before writing the instruction and
  * the request exits with finish_reason "length" (and empty text).
+ * Live measurement (GLM-5.3-Flash, thinking "low"): reasoning consumed more
+ * than the original 344-token budget, so margins are sized generously —
+ * unused headroom costs nothing because max_tokens is only an upper bound.
  */
 const THINKING_TOKEN_MARGINS: Record<ThinkingLevel | "unset", number> = {
-	unset: 512, // model default thinking state is unknown — assume it may reason
-	minimal: 64,
-	low: 256,
-	medium: 1024,
-	high: 2048,
-	xhigh: 4096,
-	max: 4096,
+	unset: 2048, // model default thinking state is unknown — assume it may reason a lot
+	minimal: 256,
+	low: 2048,
+	medium: 3072,
+	high: 6144,
+	xhigh: 6144,
+	max: 6144,
 };
 
 /**
@@ -2585,7 +2588,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				// producing no suggestion.
 				notifyOnce(
 					"length",
-					"next-prompt: suggestion truncated before output — reasoning consumed the completion budget (raise maxSuggestionChars or lower thinking)",
+					"next-prompt: suggestion truncated before output — reasoning consumed the completion budget; try a lower thinking level for suggestions",
 					"warning",
 				);
 			}

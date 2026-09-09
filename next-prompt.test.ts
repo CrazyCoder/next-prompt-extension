@@ -4915,8 +4915,8 @@ describe("Step 3 prediction behavior", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
-		// ceil(320/4)+8 = 88, + unset-thinking margin 512 = 600
-		expect(fake.calls.complete[0]!.maxTokens).toBe(600);
+		// ceil(320/4)+8 = 88, + unset-thinking margin 2048 = 2136
+		expect(fake.calls.complete[0]!.maxTokens).toBe(2136);
 	});
 
 	test("S3: OMP transport receives a thinking-aware maxTokens cap (F-09)", async () => {
@@ -4929,16 +4929,16 @@ describe("Step 3 prediction behavior", () => {
 	});
 
 	test("S4: suggestionMaxTokens adds thinking-aware reasoning headroom", () => {
-		// base 68 + unset margin 512
-		expect(suggestionMaxTokens({})).toBe(580);
-		// base 88 + low margin 256
+		// base 68 + unset margin 2048
+		expect(suggestionMaxTokens({})).toBe(2116);
+		// base 88 + low margin 2048
 		expect(suggestionMaxTokens({ maxSuggestionChars: 320, thinking: "low" })).toBe(
-			344,
+			2136,
 		);
-		// base 2508 + xhigh margin 4096
+		// base 2508 + xhigh margin 6144 → capped at 8192
 		expect(
 			suggestionMaxTokens({ maxSuggestionChars: 10000, thinking: "xhigh" }),
-		).toBe(6604);
+		).toBe(8192);
 	});
 
 	test("S5: single-line label prefix is stripped, instruction kept", () => {
