@@ -307,11 +307,15 @@ export function loadConfig(
  */
 export function loadConfigDetailed(
 	cwd: string,
-	opts: { projectTrusted?: boolean } = {},
+	opts: { projectTrusted?: boolean; trustAvailable?: boolean } = {},
 ): { cfg: NextPromptConfig; computeDisabled: boolean } {
 	const globalPath = join(getAgentDir(), "next-prompt.json");
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "next-prompt.json");
 	const projectTrusted = opts.projectTrusted ?? true;
+	// Step 4 (F-13): when the host cannot attest project trust (OMP has no
+	// trust API), a project file may only contribute non-privacy preferences;
+	// routing and cross-provider keys are global-only there.
+	const trustAvailable = opts.trustAvailable ?? true;
 
 	let globalCfg: NextPromptConfig = {};
 	let projectCfg: NextPromptConfig = {};
@@ -337,7 +341,9 @@ export function loadConfigDetailed(
 	if (projectTrusted && existsSync(projectPath)) {
 		try {
 			const parsed = parseConfig(readFileSync(projectPath, "utf-8"));
-			projectCfg = parsed.cfg;
+			projectCfg = trustAvailable
+				? parsed.cfg
+				: pickProjectPreferences(parsed.cfg);
 			if (parsed.privacyInvalid) projectInvalid = true;
 		} catch (err) {
 			console.warn(
@@ -348,10 +354,13 @@ export function loadConfigDetailed(
 	}
 
 	// Merge, then apply policy floors so repository content can never loosen
-	// a user-level privacy setting (F-02):
+	// a user-level privacy setting (F-02/F-13):
+	//  - allowCrossProviderPairs: GLOBAL-ONLY. A project file must never be
+	//    able to silently authorize a new destination (Step 4 acceptance).
 	//  - allowCrossProvider: project may tighten to false, never loosen a global false.
 	//  - maxTranscriptChars: project may reduce, never increase a global cap.
 	const merged: NextPromptConfig = { ...globalCfg, ...projectCfg };
+	merged.allowCrossProviderPairs = globalCfg.allowCrossProviderPairs;
 	if (globalCfg.allowCrossProvider === false) {
 		merged.allowCrossProvider = false;
 	}
@@ -364,6 +373,30 @@ export function loadConfigDetailed(
 		);
 	}
 	return { cfg: merged, computeDisabled: globalInvalid || projectInvalid };
+}
+
+/**
+ * Project-config keys honored even when the host cannot attest project trust
+ * (Step 4/F-13): preference fields only — never routing or cross-provider
+ * authorization, which stay global-only.
+ */
+const PROJECT_PREFERENCE_KEYS = [
+	"thinking",
+	"renderMode",
+	"acceptKey",
+	"rearmDelayMs",
+	"maxSuggestionChars",
+	"maxRecentTurns",
+] as const;
+
+function pickProjectPreferences(cfg: NextPromptConfig): NextPromptConfig {
+	const out: NextPromptConfig = {};
+	for (const key of PROJECT_PREFERENCE_KEYS) {
+		if (cfg[key] !== undefined) {
+			(out as Record<string, unknown>)[key] = cfg[key];
+		}
+	}
+	return out;
 }
 
 function parseConfig(text: string): {
@@ -509,10 +542,13 @@ function parseConfig(text: string): {
  */
 export function loadEffectiveConfig(
 	cwd: string,
-	opts: { projectTrusted?: boolean } = {},
+	opts: { projectTrusted?: boolean; trustAvailable?: boolean } = {},
 ): EffectiveConfig {
 	const projectTrusted = opts.projectTrusted ?? true;
-	const { cfg, computeDisabled } = loadConfigDetailed(cwd, { projectTrusted });
+	const { cfg, computeDisabled } = loadConfigDetailed(cwd, {
+		projectTrusted,
+		trustAvailable: opts.trustAvailable ?? true,
+	});
 	return {
 		...cfg,
 		allowCrossProvider: cfg.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER,
@@ -696,12 +732,38 @@ export function pairAllowed(
  * option label, but adapters/themes may add whitespace or ANSI styling; older
  * test callers also used the symbolic values directly.
  */
-export function consentChoiceFromLabel(
-	selected: unknown,
-): "once" | "always" | "decline" | undefined {
+export type ConsentChoice =
+	| "request"
+	| "session"
+	| "project"
+	| "always"
+	| "decline";
+
+/**
+ * Map a selector label (or internal id) to a consent duration (Step 4).
+ * Durations are accurately named: request (proceed once, persist nothing),
+ * session (in-memory, cleared on session start), project (persisted consent
+ * record), always (persisted global provider pair). The legacy pre-Step-4
+ * labels/ids still map — "once" to the least-persistent duration, since the
+ * old "Allow once (this project)" actually persisted a project grant (F-12).
+ */
+export function consentChoiceFromLabel(selected: unknown): ConsentChoice | undefined {
 	if (typeof selected !== "string") return undefined;
 	const normalized = stripAnsi(selected).trim().toLowerCase();
-	if (normalized === "once" || normalized.includes("allow once")) return "once";
+	if (
+		normalized === "request" ||
+		normalized === "once" ||
+		normalized.includes("allow this once") ||
+		normalized.includes("allow once")
+	)
+		return "request";
+	if (normalized === "session" || normalized.includes("allow for this session"))
+		return "session";
+	if (
+		normalized === "project" ||
+		normalized.includes("always allow (this project)")
+	)
+		return "project";
 	if (
 		normalized === "always" ||
 		normalized.includes("always allow for this provider pair")
@@ -2038,6 +2100,15 @@ export function projectTrustedForHost(ctx: HostContextLike): boolean {
 }
 
 /**
+ * Whether the host can attest project trust at all (Step 4/F-13). Pi exposes
+ * `isProjectTrusted()`; OMP has no such API, so project files there may only
+ * contribute non-privacy preferences (see loadConfigDetailed).
+ */
+export function hostTrustAvailableForHost(ctx: HostContextLike): boolean {
+	return typeof ctx.isProjectTrusted === "function";
+}
+
+/**
  * Narrow structural view of the extension context the controller consumes.
  * Host-specific fields are optional; the compatibility helpers normalize them.
  */
@@ -2184,6 +2255,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Session-scoped denial set: a declined consent never re-prompts (nor
 	// sends) for the remainder of the session.
 	const deniedConsents = new Set<string>();
+	// Session-scoped grant set (Step 4/F-12): the "Allow for this session"
+	// duration lives in memory only — never persisted — and dies with the
+	// session.
+	const sessionGrants = new Set<string>();
 	const shownDiagnostics = new Set<string>();
 	let consentDialogOpen = false;
 	let editorInstalled = false;
@@ -2288,6 +2363,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		shownDiagnostics.clear();
 		editorInstalled = false;
 		deniedConsents.clear();
+		sessionGrants.clear();
 
 		// F-03: no interactive UI => no invisible suggestion work in headless
 		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
@@ -2315,6 +2391,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// loader default there.
 		effective = loadEffectiveConfig(ctx.cwd, {
 			projectTrusted: projectTrustedForHost(ctx),
+			trustAvailable: hostTrustAvailableForHost(ctx),
 		});
 		if (effective.computeDisabled) {
 			ctx.ui.notify(
@@ -2425,6 +2502,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			// settle/end without a reload.
 			effective = loadEffectiveConfig(ctx.cwd, {
 				projectTrusted: projectTrustedForHost(ctx),
+				trustAvailable: hostTrustAvailableForHost(ctx),
 			});
 			if (effective.computeDisabled) return;
 			if (host === "pi" && !ctx.isIdle()) return;
@@ -2509,6 +2587,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (resolved.crossDestination) {
 			const dest = destinationOf(resolved.model);
 			const key = dest ? destinationKey(dest) : "";
+			// Only a denial stops the compute here; a session grant falls
+			// through and merely bypasses the dialog below.
 			if (!dest || deniedConsents.has(key)) return;
 			const fromProvider = ctx.model?.provider ?? "";
 			const toProvider = resolved.model.provider ?? "";
@@ -2518,38 +2598,46 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					fromProvider,
 					toProvider,
 				) &&
-				!hasConsent(ctx.cwd, dest)
+				!hasConsent(ctx.cwd, dest) &&
+				!sessionGrants.has(key)
 			) {
 				// No dialogs at all -> fail closed. Capture locals so the
 				// optional boundary fields narrow correctly below.
 				const { select, confirm } = ctx.ui;
 				if (!select && !confirm) return;
 				const transcriptSize = transcript.length;
-				const title = "next-prompt: send transcript to another provider?";
+				// Step 4 disclosure (F-11): destination and redacted transcript
+				// size in the selector title itself; the confirm fallback keeps
+				// the long detail.
+				const title = `next-prompt: send ${transcriptSize} chars to ${describeDestination(dest)}?`;
 				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
-				// Prefer the 3-option selector (allow once / always allow this
-				// provider pair / decline); fall back to a plain confirm dialog
-				// when the UI does not offer select. The selector returns the
-				// selected label, not an internal choice id.
-				const allowOnceLabel = "Allow once (this project)";
-				const alwaysAllowLabel = "Always allow for this provider pair";
+				// Step 4 durations (F-12): every label names what actually
+				// persists. "Allow this once" persists nothing.
+				const allowOnceLabel = "Allow this once";
+				const allowSessionLabel = "Allow for this session";
+				const alwaysProjectLabel = "Always allow (this project)";
+				const alwaysGlobalLabel = "Always allow for this provider pair (global)";
 				const declineLabel = "Decline";
-				let choice: string | undefined;
+				let choice: ConsentChoice | undefined;
 				consentDialogOpen = true;
 				try {
 					if (select) {
 						const selected = await select(title, [
 							allowOnceLabel,
-							alwaysAllowLabel,
+							allowSessionLabel,
+							alwaysProjectLabel,
+							alwaysGlobalLabel,
 							declineLabel,
 						]);
 						choice = consentChoiceFromLabel(selected);
 					} else if (confirm) {
 						const granted = await confirm(
 							title,
-							`${detail} Allow for this project?`,
+							`${detail} Allow for this session?`,
 						);
-						choice = granted ? "once" : "decline";
+						// The binary fallback grants the session duration only —
+						// it can never silently persist anything (F-12).
+						choice = granted ? "session" : "decline";
 					}
 				} finally {
 					consentDialogOpen = false;
@@ -2594,12 +2682,18 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 							"warning",
 						);
 					}
-				} else if (choice === "once") {
+				} else if (choice === "project") {
+					// Project duration: persisted per-project consent record.
 					grantConsent(
 						ctx.cwd,
 						dest,
 						`${resolved.model.provider}/${resolved.model.id}`,
 					);
+				} else if (choice === "session") {
+					// Session duration: in-memory only, cleared on session start.
+					sessionGrants.add(key);
+				} else if (choice === "request") {
+					// Request duration: proceed once, persist nothing (F-12).
 				} else {
 					// Decline (or dialog dismissed without a choice).
 					deniedConsents.add(key);

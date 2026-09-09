@@ -3402,7 +3402,7 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.selects).toHaveLength(1);
 		// Disclosure (F-11): destination + redacted transcript size in the title.
 		expect(fake.calls.selects[0]![0]).toContain("anthropic");
-		expect(fake.calls.selects[0]![0]).toMatch(/\d+ chars/);
+		expect(/\d+ chars/.test(fake.calls.selects[0]![0])).toBe(true);
 		// The dialog offers every duration, durable ones labeled accurately.
 		const options = fake.calls.selects[0]![1].join("|");
 		expect(options).toContain("Allow this once");
@@ -4756,7 +4756,7 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.calls.ompComplete).toHaveLength(0);
 	});
 
-	test("O3b: OMP cross-destination allow-once → completeSimple on the configured model, consent persisted", async () => {
+	test("O3b: OMP cross-destination request-scoped allow → completeSimple on the configured model, nothing persisted", async () => {
 		const configured = { provider: "anthropic", id: "haiku" };
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
@@ -4777,14 +4777,12 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
-		const consents = JSON.parse(
-			readFileSync(
+		// Request duration: nothing persisted (F-12/Step 4).
+		expect(
+			existsSync(
 				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
-				"utf-8",
 			),
-		) as Array<{ project: string }>;
-		expect(consents).toHaveLength(1);
-		expect(consents[0]!.project).toBe("/tmp");
+		).toBe(false);
 	});
 
 	test("O4: OMP consent resolved AFTER input → zero completeSimple calls, consent not persisted", async () => {
