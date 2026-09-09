@@ -1107,8 +1107,8 @@ describe("sanitizeSuggestion", () => {
 		expect(sanitizeSuggestion("```\nhi\n```", {})).toBe("hi");
 		expect(sanitizeSuggestion("```ts\nhi\n```", {})).toBe("hi");
 	});
-	test("T39: multi-line model output is rejected (strict single instruction)", () => {
-		expect(sanitizeSuggestion("line1\nline2", {})).toBe("");
+	test("T39: multi-line output takes the last valid line (extraction contract)", () => {
+		expect(sanitizeSuggestion("line1\nline2", {})).toBe("line2");
 	});
 	test("T40: caps to maxSuggestionChars at grapheme boundary", () => {
 		expect(sanitizeSuggestion("abcdefgh", { maxSuggestionChars: 3 })).toBe(
@@ -4873,9 +4873,10 @@ describe("Step 1 quality regressions (Q-series)", () => {
 		expect(sanitizeSuggestion("none")).toBe("");
 	});
 
-	test("Q8b: preamble, lists, and multi-candidate output are rejected", () => {
+	test("Q8b: preamble yields the instruction; alternative lists are rejected", () => {
+		// Last valid line wins: the preamble line fails, the instruction passes.
 		expect(sanitizeSuggestion("Here is the suggestion:\nRun the tests")).toBe(
-			"",
+			"Run the tests",
 		);
 		expect(sanitizeSuggestion("1. Run tests\n2. Commit changes")).toBe("");
 	});
@@ -4884,7 +4885,7 @@ describe("Step 1 quality regressions (Q-series)", () => {
 		expect(sanitizeSuggestion("Run the tests")).toBe("Run the tests");
 	});
 
-	test("Q8d: controller never renders preamble chatter from the model", async () => {
+	test("Q8d: controller extracts the instruction from preamble chatter", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -4895,7 +4896,7 @@ describe("Step 1 quality regressions (Q-series)", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.widgetContent?.[0] ?? "").toContain("Run the tests");
 	});
 });
 
@@ -4956,7 +4957,10 @@ describe("Step 3 prediction behavior", () => {
 			branch: [assistantEntry("a")],
 			completeResult: {
 				content: [
-					{ type: "text", text: "Here is the suggestion:\nRun the tests" },
+					{
+						type: "text",
+						text: "User asks about the timeline; likely next is a plan update — but per rules",
+					},
 				],
 				stopReason: "stop",
 			},
@@ -5082,12 +5086,25 @@ describe("suggestion quality corpus (deterministic)", () => {
 		["NONE", ""],
 		["none.", ""],
 		["NONE!", ""],
-		["Here is the suggestion:\nRun the tests", ""],
+		["Here is the suggestion:\nRun the tests", "Run the tests"],
 		["1. Run tests\n2. Commit changes", ""],
 		["Suggestion: run the linter", "run the linter"],
 		["- fix the bug", ""],
 		["", ""],
 		["   ", ""],
+		// Live-observed GLM shapes (2026-09-09, flappy session):
+		[
+			'User asks about terrain pipes. Assistant will respond.\n\nSounds good — update the plan with terrain-aware pipes and start building.',
+			'Sounds good — update the plan with terrain-aware pipes and start building.',
+		],
+		[
+			'User asks about terrain affecting pipe heights. Agent will respond. Next user instruction likely approving something — but we predict',
+			'',
+		],
+		[
+			'User asks about more features; likely next is "go ahead". Most logical: unblock implementation.\n\nGo ahead and start building.',
+			'Go ahead and start building.',
+		],
 	];
 	for (const [raw, expected] of outputCases) {
 		test(`corpus output: ${JSON.stringify(raw)} → ${JSON.stringify(expected)}`, () => {
