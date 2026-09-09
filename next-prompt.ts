@@ -1627,6 +1627,8 @@ export interface SuggestionState {
 	 * never attempted (widget-only sessions).
 	 */
 	fallbackToWidget: (() => void) | undefined;
+	/** Identity of the factory we last installed (Pi ghost-ownership check). */
+	ghostFactory?: unknown;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
 	/**
@@ -2258,6 +2260,71 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		clearSuggestion(ref.state);
 	}
 
+	// Install the ghost editor, capturing any current owner as the ghost-
+	// failure restore target. Called at session start and re-issued when a
+	// settle-time ownership check finds the slot taken by another extension.
+	function installGhostEditor(ctx: HostCtx, state: SuggestionState): void {
+		// OMP has no getEditorComponent(): `prior` stays undefined there,
+		// so a fallback restores the DEFAULT editor (setEditorComponent
+		// with no factory) rather than a captured prior owner.
+		const prior = ctx.ui.getEditorComponent?.();
+		// P1-1: permanent, guarded fallback. First call wins; once we are in
+		// widget mode there is nothing left to fall back to, so later calls
+		// (e.g. from a stale GhostEditor instance) are no-ops.
+		const fallbackToWidget = () => {
+			if (state.renderMode === "widget") return;
+			state.renderMode = "widget";
+			state.renderGhost = undefined;
+			state.ghostFactory = undefined;
+			editorInstalled = false;
+			editorInstalledForHost = false;
+			// Restore the previous owner (or the default editor) so the other
+			// extension's surface is not left half-replaced. `prior` is an
+			// opaque factory captured at the boundary and handed back
+			// verbatim; on OMP it is undefined and the default editor is
+			// restored.
+			try {
+				ctx.ui.setEditorComponent?.(prior as never);
+			} catch {
+				// Restoration is best-effort; widget mode still works.
+			}
+			ctx.ui.notify(
+				"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
+				"warning",
+			);
+			renderSuggestion(state);
+		};
+		state.fallbackToWidget = fallbackToWidget;
+		const factory = (tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
+			const ed = new GhostEditor(tui, theme, kb, state);
+			state.renderGhost = () => {
+				try {
+					ed.requestGhostRender();
+				} catch {
+					fallbackToWidget();
+				}
+			};
+			return ed;
+		};
+		state.ghostFactory = factory;
+		try {
+			ctx.ui.setEditorComponent?.(factory as never);
+			editorInstalled = true;
+			editorInstalledForHost = true;
+			if (prior && prior !== factory) {
+				ctx.ui.notify(
+					"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
+					"warning",
+				);
+			}
+		} catch {
+			// Installation threw (e.g. the owner rejected replacement): keep
+			// widget mode, restore the prior owner, and let the suggestion
+			// surface via the widget.
+			fallbackToWidget();
+		}
+	}
+
 	api.on("session_start", (_e, ctx) => {
 		reset();
 		ref.unsubInput?.();
@@ -2331,6 +2398,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			publishWidget,
 			renderGhost: undefined,
 			fallbackToWidget: undefined,
+			ghostFactory: undefined,
 			abortInflight: () => {
 				ref.inflight?.abort();
 				ref.inflight = undefined;
@@ -2341,64 +2409,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const wantGhost =
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
-		if (wantGhost && !editorInstalled) {
-			// OMP has no getEditorComponent(): `prior` stays undefined there,
-			// so a fallback restores the DEFAULT editor (setEditorComponent
-			// with no factory) rather than a captured prior owner.
-			const prior = ctx.ui.getEditorComponent?.();
-			// P1-1: permanent, guarded fallback. First call wins; once we are in
-			// widget mode there is nothing left to fall back to, so later calls
-			// (e.g. from a stale GhostEditor instance) are no-ops.
-			const fallbackToWidget = () => {
-				if (state.renderMode === "widget") return;
-				state.renderMode = "widget";
-				state.renderGhost = undefined;
-				editorInstalled = false;
-				editorInstalledForHost = false;
-				// Restore the previous owner (or the default editor) so the other
-				// extension's surface is not left half-replaced. `prior` is an
-				// opaque factory captured at the boundary and handed back
-				// verbatim; on OMP it is undefined and the default editor is
-				// restored.
-				try {
-					ctx.ui.setEditorComponent?.(prior as never);
-				} catch {
-					// Restoration is best-effort; widget mode still works.
-				}
-				ctx.ui.notify(
-					"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
-					"warning",
-				);
-				renderSuggestion(state);
-			};
-			state.fallbackToWidget = fallbackToWidget;
-			try {
-				ctx.ui.setEditorComponent?.((tui, theme, kb) => {
-					const ed = new GhostEditor(tui, theme, kb, state);
-					state.renderGhost = () => {
-						try {
-							ed.requestGhostRender();
-						} catch {
-							fallbackToWidget();
-						}
-					};
-					return ed;
-				});
-				editorInstalled = true;
-				editorInstalledForHost = true;
-				if (prior) {
-					ctx.ui.notify(
-						"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
-						"warning",
-					);
-				}
-			} catch {
-				// Installation threw (e.g. the owner rejected replacement): keep
-				// widget mode, restore the prior owner, and let the suggestion
-				// surface via the widget.
-				fallbackToWidget();
-			}
-		}
+		if (wantGhost && !editorInstalled) installGhostEditor(ctx, state);
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
 		ref.unsubInput = ctx.ui.onTerminalInput(
@@ -2754,6 +2765,23 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			cleanLen: clean.length,
 			sentinel: isSentinelOutput(raw),
 		});
+		// Ghost ownership re-acquire (live-observed 2026-09-09): after our
+		// session-start install, another extension can still replace the
+		// editor — pi-powerline-footer installs its editorFactory at session
+		// start AFTER us, and pi's tree is last-installer-wins. Our
+		// GhostEditor is discarded and the ghost can never paint, with no
+		// error raised. If Pi's getter no longer returns our factory,
+		// install on top again; the current owner becomes the restore
+		// target of a later ghost-failure fallback.
+		if (
+			clean &&
+			state.renderMode !== "widget" &&
+			typeof ctx.ui.getEditorComponent === "function" &&
+			ctx.ui.getEditorComponent() !== state.ghostFactory
+		) {
+			diag("ghost_reacquire");
+			installGhostEditor(ctx, state);
+		}
 		if (clean) {
 			if (ref.state === state)
 				showSuggestion(state, clean, generation, host === "pi");

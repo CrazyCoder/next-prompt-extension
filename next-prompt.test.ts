@@ -2379,7 +2379,6 @@ describe("controller wiring (agent_settled)", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		expect(fake.editorComponentInstalled).toBe(true);
-		const installsBefore = fake.editorComponentCalls;
 		// Simulate pi-powerline-footer (live-observed 2026-09-09): it installs
 		// its editorFactory AFTER us on the same session start, and pi discards
 		// our GhostEditor from the render tree — the ghost can never paint.
@@ -2390,12 +2389,13 @@ describe("controller wiring (agent_settled)", () => {
 		).ui.setEditorComponent(FOREIGN_EDITOR_FACTORY);
 		expect(fake.editorComponentInstalled).toBe(false);
 		const restoresBefore = fake.editorComponentRestores;
+		const callsAfterForeign = fake.editorComponentCalls;
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Ghost ownership re-established on top of the foreign owner (the
 		// historical working-with-powerline behavior): installed again, the
 		// foreign owner is NOT evicted/restored, the warning fires, and the
 		// ghost repaints instead of any widget fallback.
-		expect(fake.editorComponentCalls).toBe(installsBefore + 1);
+		expect(fake.editorComponentCalls).toBe(callsAfterForeign + 1);
 		expect(fake.lastEditorComponent === undefined).toBe(false);
 		expect(fake.editorComponentInstalled).toBe(true);
 		expect(fake.editorComponentRestores).toBe(restoresBefore);
