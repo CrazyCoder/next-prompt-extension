@@ -172,6 +172,15 @@ export interface NextPromptConfig {
 	allowCrossProviderPairs?: Array<[string, string]>;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
 	rearmDelayMs?: number;
+	/**
+	 * Whether suggestions compute automatically after an agent turn settles.
+	 * Defaults to TRUE (automatic, the original behavior). When false
+	 * (manual-only), the accept key (Alt-/ by default) doubles as the manual
+	 * trigger: press once to generate a suggestion, press again (once it is
+	 * shown) to accept it into the editor. Pressing while a suggestion is
+	 * being generated is a no-op.
+	 */
+	autoTrigger?: boolean;
 }
 
 /**
@@ -181,6 +190,8 @@ export interface NextPromptConfig {
 export interface EffectiveConfig extends NextPromptConfig {
 	/** Resolved effective boolean (never undefined). */
 	allowCrossProvider: boolean;
+	/** Resolved effective boolean (never undefined). */
+	autoTrigger: boolean;
 	/** Whether project config was trusted and therefore applied. */
 	projectTrusted: boolean;
 	/** True when invalid privacy-bearing fields caused compute to be disabled. */
@@ -244,6 +255,7 @@ const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
 export const DEFAULT_ACCEPT_KEY = "alt+/";
 export const DEFAULT_REARM_MS = 2000;
+export const DEFAULT_AUTO_TRIGGER = true;
 
 const MIN_REARM_DELAY = 50;
 /** Upper bound on a stored OpenCode session id (header hygiene). */
@@ -564,6 +576,11 @@ function parseConfig(text: string): {
 					);
 				else cfg.acceptKey = value;
 				break;
+			case "autoTrigger":
+				if (typeof value !== "boolean")
+					console.warn(`next-prompt: invalid autoTrigger in config; ignoring`);
+				else cfg.autoTrigger = value;
+				break;
 			default:
 				console.warn(`next-prompt: unknown config key "${key}" ignored`);
 		}
@@ -587,6 +604,7 @@ export function loadEffectiveConfig(
 	return {
 		...cfg,
 		allowCrossProvider: cfg.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER,
+		autoTrigger: cfg.autoTrigger ?? DEFAULT_AUTO_TRIGGER,
 		projectTrusted,
 		computeDisabled,
 	};
@@ -1749,6 +1767,8 @@ export interface SuggestionState {
 	ghostFactory?: unknown;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
+	/** True while a suggestion request is in flight (manual-trigger no-op guard). */
+	isComputing: () => boolean;
 	/**
 	 * Set by the global terminal-input listener for the current dispatch.
 	 * Custom editors consume this marker so they do not process the same key
@@ -1955,6 +1975,7 @@ function makeInputHandler(
 	state: SuggestionState,
 	isInputSuppressed: () => boolean = () => false,
 	recordGlobalInput = true,
+	onManualTrigger?: () => void,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
 		const markGlobalInput = () => {
@@ -1992,6 +2013,14 @@ function makeInputHandler(
 			state.setEditorText(state.lastSuggestion);
 			state.publishWidget(undefined);
 			scheduleRearmCheck(state, editorTextBefore);
+			return { consume: true };
+		}
+		if (isAcceptKey && state.isIdleGetter() && editorTextBefore.length === 0) {
+			// No suggestion showing: the accept key doubles as the manual trigger
+			// (autoTrigger: false). If one is already being generated, ignore the
+			// press (no-op — never two concurrent requests); otherwise compute one.
+			if (state.isComputing()) return { consume: true };
+			onManualTrigger?.();
 			return { consume: true };
 		}
 
@@ -2509,6 +2538,7 @@ export function setOmpCompletionModuleForTests(
 interface NextPromptRef {
 	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
+	computing: boolean;
 	unsubInput: (() => void) | undefined;
 }
 
@@ -2534,6 +2564,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const ref: NextPromptRef = {
 		state: undefined,
 		inflight: undefined,
+		computing: false,
 		unsubInput: undefined,
 	};
 	let effective: EffectiveConfig | undefined;
@@ -2573,6 +2604,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	function reset(): void {
 		ref.inflight?.abort();
 		ref.inflight = undefined;
+		ref.computing = false;
 		clearSuggestion(ref.state);
 	}
 
@@ -2733,6 +2765,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				ref.inflight?.abort();
 				ref.inflight = undefined;
 			},
+			isComputing: () => ref.computing,
 		};
 		ref.state = state;
 
@@ -2742,8 +2775,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (wantGhost && !editorInstalled) installGhostEditor(ctx, state);
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
+		// When autoTrigger is off, the accept key doubles as the manual trigger
+		// (see makeInputHandler): pass a callback that computes on demand.
 		ref.unsubInput = ctx.ui.onTerminalInput(
-			makeInputHandler(state, () => consentDialogOpen),
+			makeInputHandler(state, () => consentDialogOpen, true, () => {
+				void handleSettled(ctx, undefined, "manual");
+			}),
 		);
 	});
 
@@ -2764,11 +2801,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			}
 			// The terminal event carries the authoritative completed-message
 			// snapshot; prefer it over the not-yet-unwound session branch (Q6).
-			return handleSettled(ctx, e?.messages);
+			return handleSettled(ctx, e?.messages, "auto");
 		});
 	} else {
 		api.on("agent_settled", (_e, ctx) => {
-			return handleSettled(ctx);
+			return handleSettled(ctx, undefined, "auto");
 		});
 	}
 
@@ -2791,6 +2828,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	async function handleSettled(
 		ctx: HostCtx,
 		externalMessages?: unknown[],
+		source: "auto" | "manual" = "auto",
 	): Promise<void> {
 		try {
 			if (!isInteractiveContext(ctx)) return;
@@ -2803,6 +2841,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			});
 			diagEnabled = effective.debug === true;
 			if (effective.computeDisabled) return;
+			// Manual-only mode: skip suggestions arriving from the automatic
+			// settle/end hook; manual trigger presses still work.
+			if (source === "auto" && !effective.autoTrigger) return;
 			if (host === "pi" && !ctx.isIdle()) return;
 			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx, externalMessages);
@@ -3022,6 +3063,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		} as unknown as Context;
 
 		let resp: AssistantMessage | undefined;
+		ref.computing = true;
 		try {
 			resp = await completeSuggestion(host, ctx, resolved.model, context, {
 				signal: ac.signal,
@@ -3034,6 +3076,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
 			}
 			return;
+		} finally {
+			ref.computing = false;
 		}
 		diag("complete_done", {
 			sr: resp?.stopReason,
@@ -3402,6 +3446,14 @@ export async function configureInteractively(
 		"Entries are labels and sizes only — never transcript or suggestion text. Off = no log file is written.",
 	);
 	if (typeof debugPick === "boolean") update.debug = debugPick ? true : undefined;
+
+	// 11. autoTrigger (confirm): false = manual-only (the accept key doubles
+	// as the manual trigger), true = restore settle-triggered suggestions.
+	const autoPick = await ctx.ui.confirm(
+		`next-prompt: auto-trigger after each turn? [${current.autoTrigger ?? DEFAULT_AUTO_TRIGGER}]`,
+		"Yes = automatically suggest after every settled turn. No = manual-only (press the accept key to generate, then again to accept).",
+	);
+	update.autoTrigger = autoPick;
 
 	return update;
 }
