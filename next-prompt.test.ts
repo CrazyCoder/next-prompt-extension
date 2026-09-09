@@ -4156,7 +4156,39 @@ describe("configureInteractively", () => {
 		});
 		const out = await configureInteractively(ctx, {});
 		expect(out?.thinking).toBeUndefined();
-		expect(out?.maxRecentTurns).toBeUndefined(); // empty input keeps all
+		expect("maxRecentTurns" in (out ?? {})).toBe(false); // no cap saved → no-op
+	});
+
+	test("T122b: empty maxRecentTurns input DELETES the saved cap (Step 6)", async () => {
+		const ctx = makeConfigCtx({
+			answers: {
+				model: "(use current model)",
+				renderMode: "widget — colored line below the input box",
+				thinking: "(unset — model default)",
+				acceptKey: "alt+/",
+				rearmDelayMs: "2000",
+				maxTranscriptChars: "12000",
+				maxRecentTurns: "",
+				maxSuggestionChars: "240",
+				allowCrossProvider: true,
+			},
+		});
+		const out = await configureInteractively(ctx, { maxRecentTurns: 4 });
+		// Explicit-undefined marker: saveConfig() drops the key, so the file
+		// returns to "all turns" — an empty input must clear the saved cap
+		// (the Step-0 footgun), not silently keep it.
+		expect(out).not.toBeUndefined();
+		expect("maxRecentTurns" in (out as object)).toBe(true);
+		expect(out?.maxRecentTurns).toBeUndefined();
+		const saved = saveConfig(out!);
+		expect(saved.saved).toBe(true);
+		const onDisk = JSON.parse(
+			readFileSync(
+				`${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`,
+				"utf-8",
+			),
+		) as Record<string, unknown>;
+		expect("maxRecentTurns" in onDisk).toBe(false);
 	});
 
 	test("T123: invalid numeric input → field not set", async () => {
