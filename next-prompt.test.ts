@@ -58,7 +58,6 @@ import {
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
-	type HostKind,
 	type NextPromptConfig,
 	type OmpCompletionModule,
 	type SuggestionCtx,
@@ -1732,6 +1731,8 @@ describe("real pi-tui editor integration", () => {
 // Identity-stable "previous editor owner" so restore calls (which pass the
 // captured prior factory back) are distinguishable from fresh installs.
 const PRIOR_EDITOR_FACTORY = (() => {}) as never;
+// Identity-stable "foreign owner" (pi-powerline-footer-shaped) for takeover tests.
+const FOREIGN_EDITOR_FACTORY = (() => {}) as never;
 function makeFake(opts: {
 	branch?: BranchEntry[];
 	idle?: boolean;
@@ -1797,6 +1798,8 @@ function makeFake(opts: {
 	editorComponentCalls: number;
 	/** Count of restore calls: setEditorComponent(undefined) — the fallback path. */
 	editorComponentRestores: number;
+	/** Times the constructed GhostEditor requested a repaint. */
+	requestRenderCalls: number;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
 } {
@@ -1827,6 +1830,12 @@ function makeFake(opts: {
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
+	// pi-faithful ownership tracking: getEditorComponent returns whatever
+	// factory was last handed to setEditorComponent.
+	let currentEditorFactory: unknown = opts.hasPriorEditor
+		? PRIOR_EDITOR_FACTORY
+		: undefined;
+	let requestRenderCalls = 0;
 	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
@@ -1916,14 +1925,20 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
-			getEditorComponent: () =>
-				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
+			getEditorComponent: () => currentEditorFactory,
 			setEditorComponent: (
 				factory:
 					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
 					| undefined,
 			) => {
 				editorComponentCalls += 1;
+				currentEditorFactory = factory;
+				if (factory === FOREIGN_EDITOR_FACTORY) {
+					// Simulated takeover (pi-powerline-footer): another extension
+					// installed AFTER us. pi discards our editor from the tree.
+					editorComponentInstalled = false;
+					return;
+				}
 				if (factory === PRIOR_EDITOR_FACTORY) {
 					// Restore path (fallbackToWidget): the previous owner is back.
 					editorComponentInstalled = false;
@@ -1944,6 +1959,7 @@ function makeFake(opts: {
 				lastEditorComponent = factory(
 					{
 						requestRender: () => {
+							requestRenderCalls += 1;
 							if (opts.requestRenderThrows) {
 								throw new Error("ghost render pipeline failed");
 							}
@@ -2005,6 +2021,9 @@ function makeFake(opts: {
 		},
 		get editorComponentRestores() {
 			return editorComponentRestores;
+		},
+		get requestRenderCalls() {
+			return requestRenderCalls;
 		},
 		get lastEditorComponent() {
 			return lastEditorComponent;
@@ -2349,6 +2368,44 @@ describe("controller wiring (agent_settled)", () => {
 		const handler = fake.handlers.get("agent_settled")!;
 		await handler({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("T75: foreign editor takeover after install → ghost re-owned at settle, owner kept as prior (pi-powerline-footer regression)", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(true);
+		const installsBefore = fake.editorComponentCalls;
+		// Simulate pi-powerline-footer (live-observed 2026-09-09): it installs
+		// its editorFactory AFTER us on the same session start, and pi discards
+		// our GhostEditor from the render tree — the ghost can never paint.
+		(
+			fake.ctx as unknown as {
+				ui: { setEditorComponent: (f: unknown) => void };
+			}
+		).ui.setEditorComponent(FOREIGN_EDITOR_FACTORY);
+		expect(fake.editorComponentInstalled).toBe(false);
+		const restoresBefore = fake.editorComponentRestores;
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Ghost ownership re-established on top of the foreign owner (the
+		// historical working-with-powerline behavior): installed again, the
+		// foreign owner is NOT evicted/restored, the warning fires, and the
+		// ghost repaints instead of any widget fallback.
+		expect(fake.editorComponentCalls).toBe(installsBefore + 1);
+		expect(fake.lastEditorComponent === undefined).toBe(false);
+		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentRestores).toBe(restoresBefore);
+		expect(fake.requestRenderCalls).toBeGreaterThan(0);
+		expect(
+			fake.calls.notifies.some(([m]) =>
+				m.includes("another extension owns the editor"),
+			),
+		).toBe(true);
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T73: default model = ctx.model when config has no model block", async () => {
