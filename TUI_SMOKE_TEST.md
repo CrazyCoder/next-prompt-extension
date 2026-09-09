@@ -112,3 +112,16 @@ checks.
 - Configured render mode:
 - Provider/model:
 - Results / failures:
+
+## Release evidence (Step 7 gate)
+
+Tag publishing REQUIRES a dated evidence line for the exact released version
+(`publish.yml` greps for it; without it the tag cannot publish). Append one
+line here after every full pass, in exactly this format:
+
+```
+Recorded: vX.Y.Z — YYYY-MM-DD — Pi <version> (<terminals>) / OMP <version> (<terminals>) — all cases pass
+```
+
+If any case failed, do NOT append the line — fix first (a failed case is a
+release blocker per the status legend).

@@ -2,11 +2,18 @@
   "name": "@gamaraan/next-prompt",
   "version": "0.2.1",
   "description": "pi and Oh My Pi (OMP) coding-agent extension that suggests the next logical prompt after an agent turn settles (inline ghost, below-editor widget, or both).",
-  "keywords": ["pi-package", "omp"],
+  "keywords": [
+    "pi-package",
+    "omp"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "next-prompt.ts",
-  "files": ["next-prompt.ts", "README.md", "LICENSE"],
+  "files": [
+    "next-prompt.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gamaraan/next-prompt-extension.git"
@@ -22,14 +29,16 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "typecheck:omp": "tsc --noEmit -p tsconfig.omp.json",
-    "verify:package": "npm pack --dry-run --json"
+    "verify:package": "npm pack --dry-run --json | node -e 'let s=\"\";process.stdin.on(\"data\",d=>s+=d).on(\"end\",()=>{const d=JSON.parse(s);const pkg=Object.values(d)[0];const got=pkg.files.map(f=>f.path).sort();const want=[\"LICENSE\",\"README.md\",\"next-prompt.ts\",\"package.json\"].sort();if(JSON.stringify(got)!==JSON.stringify(want)){console.error(\"package contents mismatch: got \"+JSON.stringify(got)+\" want \"+JSON.stringify(want));process.exit(1)}console.log(\"package contents exact: \"+got.join(\", \"))})'"
   },
   "publishConfig": {
     "access": "public",
     "provenance": true
   },
   "pi": {
-    "extensions": ["./next-prompt.ts"]
+    "extensions": [
+      "./next-prompt.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

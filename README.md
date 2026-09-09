@@ -272,7 +272,7 @@ Clone and run the checks with [Bun](https://bun.sh):
 ```bash
 bun install
 bun run typecheck        # Pi API types (default tsconfig.json)
-bun run typecheck:omp    # OMP 17.2.12 API types (tsconfig.omp.json)
+bun run typecheck:omp    # OMP 17.2.13 API types (tsconfig.omp.json)
 bun test
 bun run verify:package
 ```
@@ -290,14 +290,16 @@ Edit `next-prompt.ts` in place and restart the host (pi or OMP) to pick up chang
 
 ## Compatibility
 
-**Pi:** supported range **0.84.0 – latest (0.84.x at time of writing)**.
+**Pi:** supported range **0.84.0 – current** (0.84.0 minimum; 0.85.1 validated
+live on 2026-09-09).
 `ModelRegistry.complete()` — which the extension calls directly — was added in
 pi 0.84.0, so older 0.80–0.83 releases are not supported. CI runs the unit suite
-and typecheck against both the oldest supported and the latest published
-`@earendil-works/pi-*` packages (`.github/workflows/test.yml` — `compat` job) on
-every PR.
+and typecheck against both the oldest supported (0.84.0) and the current
+(0.85.1) `@earendil-works/pi-*` packages (`.github/workflows/verify.yml` —
+`compat` matrix) on every PR and before every tag publish.
 
-**OMP:** supported first against **17.2.12** (the researched API version). OMP
+**OMP:** supported range **17.2.12 – 17.2.13** (17.2.12 was the researched API
+version; 17.2.13 validated live on 2026-09-09). OMP
 runs the extension through its legacy `pi.extensions` manifest and
 `@earendil-works/pi-*` import remapping — the same published package works on both
 hosts. OMP-specific behavior:
@@ -314,10 +316,13 @@ hosts. OMP-specific behavior:
 - Trust: OMP has no project-trust API; project config follows the loader default
   (global privacy floors and consent are unchanged).
 
-CI adds an OMP job that typechecks against the pinned `@oh-my-pi/*` 17.2.12
-surface (`bun run typecheck:omp`), runs the full unit suite, packs/inspects the
-extension artifact, and validates plugin discovery + `omp plugin doctor` in an
-isolated profile.
+CI runs a minimum/current matrix for BOTH hosts (`.github/workflows/verify.yml`,
+shared by PRs and tag publishing): pi 0.84.0/0.85.1 typecheck + unit suite;
+OMP 17.2.12/17.2.13 `typecheck:omp` + unit suite; the packed artifact is
+installed on both hosts (isolated OMP profile + `omp plugin doctor` must report
+zero errors; `pi install` + `pi list` must register the extension). Releases
+additionally require a dated manual TUI smoke record for the exact version in
+`TUI_SMOKE_TEST.md` — the tag cannot publish without it.
 
 ## Manual TUI smoke tests
 
