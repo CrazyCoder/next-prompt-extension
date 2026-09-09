@@ -1784,6 +1784,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
 			maxTokens?: number;
 		}>;
 		notifies: Array<[string, string]>;
@@ -1807,6 +1808,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
 			maxTokens?: number;
 		}>,
 		notifies: [] as Array<[string, string]>,
@@ -1844,6 +1846,7 @@ function makeFake(opts: {
 				options?: {
 					signal?: AbortSignal;
 					reasoning?: string;
+					reasoningEffort?: string;
 					maxTokens?: number;
 				},
 			) => {
@@ -1853,6 +1856,7 @@ function makeFake(opts: {
 					messages: context.messages,
 					signal: options?.signal,
 					reasoning: options?.reasoning,
+					reasoningEffort: options?.reasoningEffort,
 					maxTokens: options?.maxTokens,
 				});
 				if (opts.completeError) throw opts.completeError;
@@ -2382,7 +2386,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.model).toBe(configured);
 	});
 
-	test("T74b: config thinking level is passed as reasoning to complete", async () => {
+	test("T74b: config thinking passed as reasoningEffort (full-stream wire key)", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
@@ -2394,10 +2398,10 @@ describe("controller wiring (agent_settled)", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete[0]!.reasoning).toBe("low");
+		expect(fake.calls.complete[0]!.reasoningEffort).toBe("low");
 	});
 
-	test("T74c: no thinking config → reasoning undefined (model default)", async () => {
+	test("T74c: no thinking config → reasoningEffort undefined (model default)", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
@@ -2405,7 +2409,7 @@ describe("controller wiring (agent_settled)", () => {
 		// No config file → no thinking.
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
+		expect(fake.calls.complete[0]!.reasoningEffort).toBeUndefined();
 	});
 
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {

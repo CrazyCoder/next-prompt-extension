@@ -2006,7 +2006,11 @@ export interface HostCtx extends HostContextLike {
 			context: Context,
 			options?: {
 				signal?: AbortSignal;
-				reasoning?: ThinkingLevel;
+				/** Full-stream options key. ModelRegistry.complete does NOT
+				 * translate the simple-stream `reasoning` key (verified in pi
+				 * 0.85.1: only streamSimple maps reasoning → reasoningEffort),
+				 * so the extension must send the wire-level key itself. */
+				reasoningEffort?: ThinkingLevel;
 				maxTokens?: number;
 			},
 		) => Promise<AssistantMessage>;
@@ -2640,7 +2644,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		},
 	): Promise<AssistantMessage | undefined> {
 		if (hostKind === "pi") {
-			return ctx.modelRegistry.complete!(model, context, options);
+			// ModelRegistry.complete takes the full per-API stream options, where
+			// the reasoning level is spelled `reasoningEffort`. The simple-stream
+			// key `reasoning` is silently ignored on this path — passing it meant
+			// GLM-class models ran uncontrolled default thinking and burned the
+			// completion budget (root cause of the length-truncation warnings).
+			return ctx.modelRegistry.complete!(model, context, {
+				signal: options.signal,
+				reasoningEffort: options.reasoning,
+				maxTokens: options.maxTokens,
+			});
 		}
 		const mod = await loadOmpCompletionModule();
 		if (!mod.completeSimple) {
