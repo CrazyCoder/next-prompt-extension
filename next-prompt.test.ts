@@ -5105,6 +5105,14 @@ describe("suggestion quality corpus (deterministic)", () => {
 			'User asks about more features; likely next is "go ahead". Most logical: unblock implementation.\n\nGo ahead and start building.',
 			'Go ahead and start building.',
 		],
+		// Live-observed GLM meta-voice (2026-09-09, flappy session): describes
+		// what the user should type instead of EMITTING the literal next
+		// prompt. The quoted directive inside is the instruction (Gabi:
+		// expected exactly "execute core gameplay").
+		[
+			'Next input I need from you: **"execute core gameplay"** — that unblocks Phase B (B1 bird entity, B2 physics/input, B3 terrain mesh, B4 terrain-aware pipes, B5 collision/death, B6 scoring/states, B7 pause). Everything else stays blocked until then.',
+			'execute core gameplay',
+		],
 	];
 	for (const [raw, expected] of outputCases) {
 		test(`corpus output: ${JSON.stringify(raw)} → ${JSON.stringify(expected)}`, () => {
