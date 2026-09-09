@@ -2745,7 +2745,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				// at the floor, where that advice is a no-op). Surface once.
 				const cap = suggestionMaxTokens(effective);
 				const out = resp.usage?.output ?? 0;
-				const reasoning = resp.usage?.reasoning ?? 0;
+				// Boundary: Pi's Usage reports reasoning tokens; OMP's pinned
+				// pi-ai Usage type does not have the field. Cast is confined
+				// here — undefined simply means "unknown" (0).
+				const reasoning = (resp.usage as { reasoning?: number } | undefined)
+					?.reasoning ?? 0;
 				const message =
 					reasoning > 0
 						? `next-prompt: suggestion truncated — thinking consumed ${reasoning} of ${cap} completion tokens before any instruction was written`
