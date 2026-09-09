@@ -1377,6 +1377,22 @@ export function sanitizeSuggestion(
 			}
 		}
 
+		// Meta-voice wrap (live-observed GLM, 2026-09-09): "Next input I need
+		// from you: **"execute core gameplay"** ..." DESCRIBES the instruction
+		// instead of emitting it. The quoted directive inside is the intended
+		// next prompt — extract it; a meta line without a quote is rejected.
+		if (
+			/(?:next\s+input\s+I\s+need\s+from\s+you|your\s+next\s+(?:input|prompt|instruction))/i.test(
+				s,
+			)
+		) {
+			const q =
+				s.match(/"([^"\n]{1,240})"/) ?? s.match(/“([^“”\n]{1,240})”/);
+			if (!q) continue;
+			s = q[1]!.trim();
+			if (s.length === 0) continue;
+		}
+
 		if (NARRATION_RE.test(s)) continue;
 		// NONE sentinel (case-insensitive, optional terminal punctuation).
 		if (isSentinelOutput(s)) continue;
