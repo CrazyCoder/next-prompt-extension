@@ -1377,15 +1377,15 @@ export function sanitizeSuggestion(
 			}
 		}
 
-		// Meta-voice wrap (live-observed GLM, 2026-09-09): "Next input I need
-		// from you: **"execute core gameplay"** ..." DESCRIBES the instruction
-		// instead of emitting it. The quoted directive inside is the intended
-		// next prompt — extract it; a meta line without a quote is rejected.
-		if (
-			/(?:next\s+input\s+I\s+need\s+from\s+you|your\s+next\s+(?:input|prompt|instruction))/i.test(
-				s,
-			)
-		) {
+		// Meta-voice wrap (live-observed GLM, 2026-09-09): lines that DESCRIBE
+		// the instruction instead of emitting it — "Next input I need from
+		// you: **"execute core gameplay"** ..." or readiness/status reports
+		// like 'Ready for the **"execute verification"** gate whenever you
+		// want'. The quoted directive inside is the intended next prompt —
+		// extract it; a meta line without a quote is rejected.
+		const META_VOICE_RE =
+			/(?:next\s+input\s+I\s+need\s+from\s+you|your\s+next\s+(?:input|prompt|instruction|step)|(?:^|\s)ready\s+for\b|whenever\s+you(?:'re|\s+are)\s+ready\b|whenever\s+you\s+want\b|say\s+the\s+word\b)/i;
+		if (META_VOICE_RE.test(s)) {
 			const q =
 				s.match(/"([^"\n]{1,240})"/) ?? s.match(/“([^“”\n]{1,240})”/);
 			if (!q) continue;
