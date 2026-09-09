@@ -913,7 +913,7 @@ export function resolveSuggestionModel(
 		if (!notifiedRef.value) {
 			notifiedRef.value = true;
 			ctx.ui.notify(
-				`next-prompt: configured model ${config.model.provider}/${config.model.model} not found, using current model`,
+				`next-prompt: configured model ${config.model.provider}/${config.model.model} not found, using current model (${active?.provider ?? "unknown"}/${active?.id ?? "unknown"})`,
 				"warning",
 			);
 		}
@@ -2206,7 +2206,10 @@ class DecoratingGhostEditor extends CustomEditor {
 		this.prior.setText(text);
 	}
 
-	override getPaddingX(): number {
+	// Plain methods (no `override`): OMP's pinned CustomEditor does not
+	// declare getPaddingX/setAutocompleteMaxVisible — this satisfies both
+	// hosts.
+	getPaddingX(): number {
 		return this.prior.getPaddingX?.() ?? 0;
 	}
 
@@ -2214,7 +2217,10 @@ class DecoratingGhostEditor extends CustomEditor {
 		this.prior.setPaddingX?.(padding);
 	}
 
-	override setAutocompleteMaxVisible(max: number): void {
+	// No `override` modifier: OMP's pinned CustomEditor types do not declare
+	// setAutocompleteMaxVisible (pi's Editor does) — a plain method satisfies
+	// both hosts.
+	setAutocompleteMaxVisible(max: number): void {
 		this.prior.setAutocompleteMaxVisible?.(max);
 	}
 
@@ -2672,12 +2678,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Shared settled-turn handling. Guard order (unchanged from the Pi
-	 * controller): interactive context; session state and effective config
-	 * exist; config remains valid after reload; agent is idle; editor is
-	 * empty; then `maybeCompute` re-checks `shouldTrigger` before any request.
-	 */
-	/**
 	 * Shared settled-turn handling. Guard order:
 	 * interactive context; session state and effective config exist; config
 	 * remains valid after reload; agent is idle (Pi only — see below); editor
@@ -2697,7 +2697,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ctx: HostCtx,
 		externalMessages?: unknown[],
 	): Promise<void> {
-			try {
+		try {
 			if (!isInteractiveContext(ctx)) return;
 			if (!ref.state || !effective) return;
 			// Re-read config so a mid-session edit takes effect on the next
@@ -3194,12 +3194,17 @@ export async function configureInteractively(
 			update.maxTranscriptChars = n;
 	}
 
-	// 7. maxRecentTurns (numeric text; disclosure minimization — empty keeps all)
+	// 7. maxRecentTurns (numeric text; disclosure minimization). Empty input
+	// means "all turns" — if a cap is saved, mark it for deletion so the
+	// file returns to the default (the Step-0 footgun: an empty input used
+	// to silently keep the saved cap).
 	const rtPick = await ctx.ui.input(
-		`next-prompt: max recent turns sent in transcript (empty = all) [${current.maxRecentTurns ?? "all"}]`,
+		`next-prompt: max recent turns sent in transcript (empty = all, deletes the saved cap) [${current.maxRecentTurns ?? "all"}]`,
 		current.maxRecentTurns === undefined ? "" : String(current.maxRecentTurns),
 	);
-	if (rtPick && rtPick.trim().length > 0) {
+	if (rtPick !== undefined && rtPick.trim().length === 0) {
+		if (current.maxRecentTurns !== undefined) update.maxRecentTurns = undefined;
+	} else if (rtPick && rtPick.trim().length > 0) {
 		const n = Number(rtPick.trim());
 		if (Number.isInteger(n) && n >= MIN_RECENT_TURNS && n <= MAX_RECENT_TURNS)
 			update.maxRecentTurns = n;

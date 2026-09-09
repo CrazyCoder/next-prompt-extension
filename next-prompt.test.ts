@@ -2628,6 +2628,32 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ to accept");
 	});
 
+	test("T74f: configured-model fallback warns ONCE per session with the effective model (Step 6)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: () => undefined, // configured model never resolves
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ model: { provider: "anthropic", model: "haiku" } }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const warnings = fake.calls.notifies.filter(
+			([m, t]) =>
+				t === "warning" &&
+				m.includes("anthropic/haiku") &&
+				m.includes("not found"),
+		);
+		// Exactly one fallback warning per session, naming the effective model.
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]![0]).toContain("using current model");
+		expect(warnings[0]![0]).toContain("openai/gpt");
+	});
+
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {
 		const active = { provider: "openai", id: "gpt" };
 		const configured = { provider: "anthropic", id: "haiku" };
@@ -4520,7 +4546,7 @@ describe("OMP lifecycle (agent_end)", () => {
 });
 
 describe("OMP completion transport (completeSimple)", () => {
-	test("C1: Pi completion uses modelRegistry.complete and never invokes the OMP loader", async () => {
+	test("TA1: Pi completion uses modelRegistry.complete and never invokes the OMP loader", async () => {
 		let loaderCalls = 0;
 		setOmpCompletionModuleForTests(() => {
 			loaderCalls += 1;
@@ -4543,7 +4569,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(fake.loaderCalls).toBe(1);
 	});
 
-	test("C3: OMP options — resolved model, exact context, registry resolver as apiKey, signal, reasoning", async () => {
+	test("TA3: OMP options — resolved model, exact context, registry resolver as apiKey, signal, reasoning", async () => {
 		const configured = { provider: "anthropic", id: "haiku" };
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
@@ -4647,7 +4673,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(failed).toHaveLength(1);
 	});
 
-	test("C8: abort while OMP transport pending → no error notify, no stale render", async () => {
+	test("OA8: abort while OMP transport pending → no error notify, no stale render", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleError: new Error("boom"),
@@ -4662,7 +4688,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		).toBe(false);
 	});
 
-	test("C9: completeSimple absent → controlled diagnostic, no crash, no suggestion", async () => {
+	test("OA9: completeSimple absent → controlled diagnostic, no crash, no suggestion", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleUnavailable: true,
