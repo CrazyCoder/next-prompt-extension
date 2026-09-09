@@ -52,7 +52,6 @@
  */
 
 import {
-	appendFileSync,
 	existsSync,
 	readFileSync,
 	writeFileSync,
@@ -1678,24 +1677,14 @@ function showSuggestion(
 	generation: number,
 	checkIdle: boolean,
 ): void {
-	if (generation !== state.inputGeneration) {
-		diag("show_drop", { why: "generation" });
-		return;
-	}
-	if (state.getEditorText().length > 0) {
-		diag("show_drop", { why: "editor-busy" });
-		return;
-	}
-	if (checkIdle && !state.isIdleGetter()) {
-		diag("show_drop", { why: "not-idle" });
-		return;
-	}
+	if (generation !== state.inputGeneration) return;
+	if (state.getEditorText().length > 0) return;
+	if (checkIdle && !state.isIdleGetter()) return;
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
 	renderSuggestion(state);
-	diag("shown", { len: text.length, mode: state.renderMode });
 }
 
 /**
@@ -1925,31 +1914,14 @@ class GhostEditor extends CustomEditor {
 		// repaints after a re-arm.
 		this.tui = tui;
 		this.suggestionState = state;
-		// TEMP diagnostic: who invoked the factory?
-		diag("ghost_ctor", {
-			stack: (new Error().stack ?? "").replace(/\n/g, " | ").slice(0, 500),
-		});
-	}
-
-	// TEMP diagnostic: proves the tree's live editor is THIS instance — pi's
-	// getEditorText goes through getExpandedText on the active editor.
-	override getExpandedText(): string {
-		const t = super.getExpandedText();
-		diag("ghost_alive", {
-			n: t.length,
-			sug: this.suggestionState.suggestion.length,
-		});
-		return t;
 	}
 
 	/** Public so the controller can trigger a re-render when the ghost value changes. */
 	requestGhostRender(): void {
-		diag("ghost_req", { tui: Boolean(this.tui) }); // TEMP diagnostic
 		try {
 			this.tui?.requestRender();
 		} catch {
 			// Render pipeline broken -> treat as a ghost failure (P1-1).
-			diag("ghost_req_throw"); // TEMP diagnostic
 			this.suggestionState.fallbackToWidget?.();
 		}
 	}
@@ -1968,24 +1940,11 @@ class GhostEditor extends CustomEditor {
 			const ghostText = suggestion
 				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
 				: suggestion;
-			const out = overlayGhost(base, ghostText, width);
-			if (suggestion) {
-				// TEMP diagnostic: proves render sees the suggestion and the
-				// overlay actually changes the painted lines.
-				diag("ghost_render", {
-					w: width,
-					sugLen: suggestion.length,
-					baseN: base.length,
-					changed: out.some((l, i) => l !== base[i]),
-					hasMarker: base.some((l) => l.includes(CURSOR_MARKER)),
-				});
-			}
-			return out;
-		} catch (e) {
+			return overlayGhost(base, ghostText, width);
+		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
 			// mode (restoring the previous editor owner).
-			diag("ghost_render_throw", { err: String(e).slice(0, 200) }); // TEMP diagnostic
 			this.suggestionState.fallbackToWidget?.();
 			return base;
 		}
@@ -2202,20 +2161,6 @@ interface NextPromptRef {
 	unsubInput: (() => void) | undefined;
 }
 
-// TEMPORARY blank-suggestions diagnostic: appends one JSON line per decision
-// to next-prompt-debug.log (labels + sizes only — never prompts/secrets).
-// Remove once the live silence root cause is fixed.
-function diag(event: string, fields: Record<string, unknown> = {}): void {
-	try {
-		appendFileSync(
-			join(getAgentDir(), "next-prompt-debug.log"),
-			JSON.stringify({ t: new Date().toISOString(), event, ...fields }) + "\n",
-		);
-	} catch {
-		/* best effort */
-	}
-}
-
 export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const host = detectHost(pi);
 	const ref: NextPromptRef = {
@@ -2254,7 +2199,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	};
 
 	function reset(): void {
-		if (ref.inflight) diag("abort", { why: "reset" });
 		ref.inflight?.abort();
 		ref.inflight = undefined;
 		clearSuggestion(ref.state);
@@ -2361,11 +2305,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		effective = loadEffectiveConfig(ctx.cwd, {
 			projectTrusted: projectTrustedForHost(ctx),
 		});
-		diag("session_start", {
-			host,
-			renderMode: effective.renderMode,
-			computeDisabled: effective.computeDisabled,
-		});
 		if (effective.computeDisabled) {
 			ctx.ui.notify(
 				"next-prompt: invalid privacy-sensitive config; suggestions disabled",
@@ -2468,36 +2407,19 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ctx: HostCtx,
 		externalMessages?: unknown[],
 	): Promise<void> {
-		diag("settled", { host });
-		try {
-			if (!isInteractiveContext(ctx)) {
-				diag("settled_skip", { why: "non-interactive" });
-				return;
-			}
-			if (!ref.state || !effective) {
-				diag("settled_skip", { why: "no-state" });
-				return;
-			}
+			try {
+			if (!isInteractiveContext(ctx)) return;
+			if (!ref.state || !effective) return;
 			// Re-read config so a mid-session edit takes effect on the next
 			// settle/end without a reload.
 			effective = loadEffectiveConfig(ctx.cwd, {
 				projectTrusted: projectTrustedForHost(ctx),
 			});
-			if (effective.computeDisabled) {
-				diag("settled_skip", { why: "compute-disabled" });
-				return;
-			}
-			if (host === "pi" && !ctx.isIdle()) {
-				diag("settled_skip", { why: "not-idle" });
-				return;
-			}
-			if (ctx.ui.getEditorText().length > 0) {
-				diag("settled_skip", { why: "editor-busy" });
-				return;
-			}
+			if (effective.computeDisabled) return;
+			if (host === "pi" && !ctx.isIdle()) return;
+			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx, externalMessages);
 		} catch (err) {
-			diag("settled_error", { err: String(err) });
 			console.warn("next-prompt: settled-turn handler failed", err);
 		}
 	}
@@ -2548,7 +2470,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// Pi: compaction-aware buildSessionContext(); OMP: the terminal
 		// agent_end.messages snapshot; raw branch as the last resort.
 		const sourceEntries = sessionEntries(ctx, externalMessages);
-		diag("compute", { entries: sourceEntries.length });
 		if (
 			shouldTrigger(
 				sourceEntries,
@@ -2560,26 +2481,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				ctx.ui.getEditorText(),
 			) !== "compute"
 		) {
-			diag("compute_skip", { why: "shouldTrigger" });
 			return;
 		}
 		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
-		if (!resolved.model) {
-			diag("compute_skip", { why: "no-model" });
-			return;
-		}
+		if (!resolved.model) return;
 		const transcript = buildTranscript(sourceEntries, effective);
 		// An empty normalized context has nothing to predict from — never
 		// call the model (Q3).
-		if (!transcript.trim()) {
-			diag("compute_skip", { why: "empty-transcript" });
-			return;
-		}
-		diag("compute_go", {
-			tChars: transcript.length,
-			model: `${resolved.model.provider}/${resolved.model.id}`,
-			cross: resolved.crossDestination,
-		});
+		if (!transcript.trim()) return;
 
 		// F-02 / F-10: cross-destination disclosure requires explicit, persisted
 		// per-project consent. Fail closed on decline; never re-prompt in-session.
@@ -2589,10 +2498,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (resolved.crossDestination) {
 			const dest = destinationOf(resolved.model);
 			const key = dest ? destinationKey(dest) : "";
-			if (!dest || deniedConsents.has(key)) {
-				diag("compute_skip", { why: "consent-denied" });
-				return;
-			}
+			if (!dest || deniedConsents.has(key)) return;
 			const fromProvider = ctx.model?.provider ?? "";
 			const toProvider = resolved.model.provider ?? "";
 			if (
@@ -2606,10 +2512,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				// No dialogs at all -> fail closed. Capture locals so the
 				// optional boundary fields narrow correctly below.
 				const { select, confirm } = ctx.ui;
-				if (!select && !confirm) {
-					diag("compute_skip", { why: "no-consent-dialog" });
-					return;
-				}
+				if (!select && !confirm) return;
 				const transcriptSize = transcript.length;
 				const title = "next-prompt: send transcript to another provider?";
 				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
@@ -2709,7 +2612,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		} as unknown as Context;
 
 		let resp: AssistantMessage | undefined;
-		const t0 = Date.now();
 		try {
 			resp = await completeSuggestion(host, ctx, resolved.model, context, {
 				signal: ac.signal,
@@ -2717,25 +2619,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				maxTokens: suggestionMaxTokens(effective),
 			});
 		} catch (err) {
-			diag("complete_throw", {
-				aborted: ac.signal.aborted,
-				err: String(err).slice(0, 200),
-				ms: Date.now() - t0,
-			});
 			if (!ac.signal.aborted) {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
 			}
 			return;
 		}
-		diag("complete_done", {
-			sr: resp?.stopReason,
-			out: resp?.usage?.output,
-			ms: Date.now() - t0,
-		});
-		if (ac.signal.aborted || generation !== state.inputGeneration) {
-			diag("compute_skip", { why: "stale-after-complete" });
-			return;
-		}
+		if (ac.signal.aborted || generation !== state.inputGeneration) return;
 		if (resp === undefined) return; // transport unavailable; diagnostic already shown
 
 		if (resp.stopReason !== "stop") {
@@ -2760,11 +2649,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
-		diag("sanitize", {
-			rawLen: raw.length,
-			cleanLen: clean.length,
-			sentinel: isSentinelOutput(raw),
-		});
 		// Ghost ownership re-acquire (live-observed 2026-09-09): after our
 		// session-start install, another extension can still replace the
 		// editor — pi-powerline-footer installs its editorFactory at session
@@ -2779,7 +2663,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			typeof ctx.ui.getEditorComponent === "function" &&
 			ctx.ui.getEditorComponent() !== state.ghostFactory
 		) {
-			diag("ghost_reacquire");
 			installGhostEditor(ctx, state);
 		}
 		if (clean) {
