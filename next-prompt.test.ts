@@ -2542,6 +2542,52 @@ describe("controller wiring (agent_settled)", () => {
 		).toBe(true);
 	});
 
+	test("C17: unfocused decorator over a prompt-glyph editor still paints the ghost", async () => {
+		class GlyphEditor {
+			focused = false;
+			text = "";
+			render(width: number): string[] {
+				// pi-powerline-footer's BashModeEditor shape: a decorative prompt
+				// glyph on the content line and NO cursor marker when unfocused.
+				return [`> ${" ".repeat(Math.max(0, width - 2))}`];
+			}
+			handleInput(): void {}
+			getText(): string {
+				return this.text;
+			}
+			getExpandedText(): string {
+				return this.text;
+			}
+			setText(t: string): void {
+				this.text = t;
+			}
+		}
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: () => new GlyphEditor(),
+			completeResult: {
+				content: [{ type: "text", text: "painted anyway" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+		};
+		// The harness never focuses the editor (unfocused tree, like a tab
+		// switch): the overlay must still paint because the prior editor IS
+		// empty — its prompt glyph is decoration, not content.
+		const painted = ed.render(80).join("\n");
+		expect(painted).toContain("painted anyway");
+	});
+
 	test("T73: default model = ctx.model when config has no model block", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],

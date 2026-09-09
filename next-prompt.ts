@@ -52,6 +52,7 @@
  */
 
 import {
+	appendFileSync,
 	existsSync,
 	readFileSync,
 	writeFileSync,
@@ -1568,6 +1569,9 @@ export function overlayGhost(
 	lines: string[],
 	ghost: string,
 	width: number,
+	opts: { /** Caller vouches the editor is empty (decorator over a foreign
+	 * editor whose prompt glyph would otherwise read as content). */
+		assumeEmpty?: boolean } = {},
 ): string[] {
 	if (!ghost || lines.length === 0) return lines;
 
@@ -1599,7 +1603,10 @@ export function overlayGhost(
 		if (contentIdx === -1) return lines;
 		const line = result[contentIdx]!;
 		const plain = stripAnsi(line);
-		if (plain.trim().length > 0) return lines; // editor has content; leave it
+		// "Never replace real content" — unless the caller vouches the editor
+		// is empty (Step 5 decorator over a foreign editor whose decorative
+		// prompt glyph would otherwise trip this bail and darken the ghost).
+		if (plain.trim().length > 0 && !opts.assumeEmpty) return lines;
 		// Blank line: no real left padding to preserve (the whole line is padding).
 		const lineVisible = visibleWidth(line);
 		const cap = Math.max(1, lineVisible);
@@ -1774,12 +1781,18 @@ function showSuggestion(
 	generation: number,
 	checkIdle: boolean,
 ): void {
-	if (renderGate(state, generation, checkIdle) !== undefined) return;
+	if (renderGate(state, generation, checkIdle) !== undefined) {
+		diag("show_drop", {
+			why: renderGate(state, generation, checkIdle),
+		});
+		return;
+	}
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
 	renderSuggestion(state);
+	diag("shown", { len: text.length, mode: state.renderMode });
 }
 
 /**
@@ -2162,7 +2175,12 @@ class DecoratingGhostEditor extends CustomEditor {
 			const ghostText = suggestion
 				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
 				: suggestion;
-			return overlayGhost(base, ghostText, width);
+			// The prior editor may render decorative prompt glyphs even when
+			// empty (pi-powerline-footer's `>`): vouch emptiness via its own
+			// text so the unfocused overlay branch cannot bail on them.
+			return overlayGhost(base, ghostText, width, {
+				assumeEmpty: this.prior.getText().length === 0,
+			});
 		} catch {
 			this.suggestionState.fallbackToWidget?.();
 			return base;
@@ -2434,6 +2452,19 @@ interface NextPromptRef {
 	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
 	unsubInput: (() => void) | undefined;
+}
+
+// TEMPORARY ghost-darkness diagnostic (remove before release): one JSON line
+// per decision to next-prompt-debug.log — labels + sizes only, never content.
+function diag(event: string, fields: Record<string, unknown> = {}): void {
+	try {
+		appendFileSync(
+			join(getAgentDir(), "next-prompt-debug.log"),
+			JSON.stringify({ t: new Date().toISOString(), event, ...fields }) + "\n",
+		);
+	} catch {
+		/* best effort */
+	}
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -2711,6 +2742,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx, externalMessages);
 		} catch (err) {
+			diag("settled_error", { err: String(err).slice(0, 160) });
 			console.warn("next-prompt: settled-turn handler failed", err);
 		}
 	}
@@ -2780,6 +2812,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// An empty normalized context has nothing to predict from — never
 		// call the model (Q3).
 		if (!transcript.trim()) return;
+		diag("compute_go", {
+			tChars: transcript.length,
+			model: `${resolved.model.provider}/${resolved.model.id}`,
+			cross: resolved.crossDestination,
+		});
 
 		// F-02 / F-10: cross-destination disclosure requires explicit, persisted
 		// per-project consent. Fail closed on decline; never re-prompt in-session.
@@ -2931,6 +2968,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			}
 			return;
 		}
+		diag("complete_done", {
+			sr: resp?.stopReason,
+			out: resp?.usage?.output,
+		});
 		if (ac.signal.aborted || generation !== state.inputGeneration) return;
 		if (resp === undefined) return; // transport unavailable; diagnostic already shown
 
@@ -2968,6 +3009,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
+		diag("sanitize", { rawLen: raw.length, cleanLen: clean.length });
 		// Ghost ownership re-acquire (live-observed 2026-09-09): after our
 		// session-start install, another extension can still replace the
 		// editor — pi-powerline-footer installs its editorFactory at session
@@ -2982,6 +3024,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			typeof ctx.ui.getEditorComponent === "function" &&
 			ctx.ui.getEditorComponent() !== state.ghostFactory
 		) {
+			diag("ghost_reacquire");
 			installGhostEditor(ctx, state);
 		}
 		if (clean) {
