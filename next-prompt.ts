@@ -1267,15 +1267,26 @@ export function sanitizeTerminalText(text: string): string {
  * APIs, so the output cap must reserve headroom for them — otherwise a
  * thinking model burns the whole budget before writing the instruction and
  * the request exits with finish_reason "length" (and empty text).
- * Live measurement (GLM-5.3-Flash, thinking "low"): reasoning consumed more
- * than the original 344-token budget, so margins are sized generously —
- * unused headroom costs nothing because max_tokens is only an upper bound.
+ *
+ * Calibrated 2026-09-09 against live GLM-5.3-Flash measurements through
+ * pi's real provider path (see the plan addendum for the full table):
+ * - `unset` (no effort param): ~2,400 reasoning tokens on a ~10k-char
+ *   transcript — the previous 2048 margin truncated mid-thinking;
+ * - `medium`: ~2,400 reasoning tokens;
+ * - `high`: 1,132–2,300 reasoning tokens (headroom is free — max_tokens is
+ *   only an upper bound, so generous is safe);
+ * - `low`: 0 reasoning tokens, but low is where narration run-ons live —
+ *   the margin stays large so the instruction that follows the ramble has
+ *   tailroom to appear at all (the sanitizer rejects the ramble itself);
+ * - `minimal`: measured to suppress thinking entirely.
+ * Margins drift with provider behavior; if a cap is hit again the P2a
+ * warning reports the real usage instead of guessing the cause.
  */
 const THINKING_TOKEN_MARGINS: Record<ThinkingLevel | "unset", number> = {
-	unset: 2048, // model default thinking state is unknown — assume it may reason a lot
+	unset: 3072, // measured ~2400 reasoning tokens when no effort is sent
 	minimal: 256,
-	low: 2048,
-	medium: 3072,
+	low: 2432, // no reasoning, but narration run-ons need instruction tailroom
+	medium: 3072, // measured ~2400 reasoning tokens
 	high: 6144,
 	xhigh: 6144,
 	max: 6144,

@@ -5016,8 +5016,8 @@ describe("Step 3 prediction behavior", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
-		// ceil(320/4)+8 = 88, + unset-thinking margin 2048 = 2136
-		expect(fake.calls.complete[0]!.maxTokens).toBe(2136);
+		// ceil(320/4)+8 = 88, + unset-thinking margin 3072 = 3160 (P2b-calibrated)
+		expect(fake.calls.complete[0]!.maxTokens).toBe(3160);
 	});
 
 	test("S3: OMP transport receives a thinking-aware maxTokens cap (F-09)", async () => {
@@ -5029,13 +5029,22 @@ describe("Step 3 prediction behavior", () => {
 		expect(cap).toBeLessThanOrEqual(8192);
 	});
 
-	test("S4: suggestionMaxTokens adds thinking-aware reasoning headroom", () => {
-		// base 68 + unset margin 2048
-		expect(suggestionMaxTokens({})).toBe(2116);
-		// base 88 + low margin 2048
+	test("S4: suggestionMaxTokens adds thinking-aware reasoning headroom (P2b-calibrated)", () => {
+		// unset margin 3072: measured ~2400 thinking tokens when no effort is
+		// sent — the old 2048 margin truncated mid-thinking (2026-09-09).
+		expect(suggestionMaxTokens({})).toBe(68 + 3072);
+		// low margin 2432: reasoning measured 0 at low, but narration run-ons
+		// need tailroom for the instruction that follows them.
 		expect(suggestionMaxTokens({ maxSuggestionChars: 320, thinking: "low" })).toBe(
-			2136,
+			88 + 2432,
 		);
+		// minimal margin 256: measured to suppress thinking entirely.
+		expect(suggestionMaxTokens({ thinking: "minimal" })).toBe(68 + 256);
+		// medium margin 3072: measured ~2400 thinking tokens.
+		expect(suggestionMaxTokens({ thinking: "medium" })).toBe(68 + 3072);
+		// high margin 6144: measured 1132–2300 thinking tokens, headroom is
+		// free (max_tokens is an upper bound).
+		expect(suggestionMaxTokens({ thinking: "high" })).toBe(68 + 6144);
 		// base 2508 + xhigh margin 6144 → capped at 8192
 		expect(
 			suggestionMaxTokens({ maxSuggestionChars: 10000, thinking: "xhigh" }),
