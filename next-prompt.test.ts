@@ -2441,6 +2441,9 @@ describe("controller wiring (agent_settled)", () => {
 			focused = true;
 			text = "";
 			inputs: string[] = [];
+			insertions: string[] = [];
+			history: string[] = [];
+			borderColor = (s: string): string => s;
 			onSubmit?: (t: string) => void;
 			constructor(
 				_tui: unknown,
@@ -2463,6 +2466,13 @@ describe("controller wiring (agent_settled)", () => {
 			}
 			setText(t: string): void {
 				this.text = t;
+			}
+			insertTextAtCursor(t: string): void {
+				this.insertions.push(t);
+				this.text += t;
+			}
+			addToHistory(t: string): void {
+				this.history.push(t);
 			}
 		}
 		const priorInstances: DistinctiveEditor[] = [];
@@ -2516,6 +2526,22 @@ describe("controller wiring (agent_settled)", () => {
 		// (This keypress also dismisses the accepted suggestion: correct.)
 		ed.handleInput("z");
 		expect(prior.inputs).toContain("z");
+		// Step 1 (E-01/E-02/E-03): the full editor surface pi drives on
+		// `this.editor` must reach the prior, not the decorator's dead state.
+		const contract = ed as unknown as {
+			insertTextAtCursor: (t: string) => void;
+			addToHistory: (t: string) => void;
+			borderColor: (s: string) => string;
+		};
+		contract.insertTextAtCursor("/tmp/pi-clipboard-test.png");
+		expect(prior.insertions).toEqual(["/tmp/pi-clipboard-test.png"]);
+		expect(prior.getText()).toContain("/tmp/pi-clipboard-test.png");
+		contract.addToHistory("!ls");
+		expect(prior.history).toEqual(["!ls"]);
+		const bashBorder = (s: string): string => `bash:${s}`;
+		contract.borderColor = bashBorder;
+		expect(prior.borderColor).toBe(bashBorder);
+		expect(contract.borderColor).toBe(bashBorder);
 	});
 
 	test("C16: prior editor construction fails → ghost falls back, prior owner restored (Step 5)", async () => {

@@ -2093,6 +2093,9 @@ interface PriorEditorLike {
 	getText(): string;
 	getExpandedText?: () => string;
 	setText(text: string): void;
+	insertTextAtCursor?: (text: string) => void;
+	addToHistory?: (text: string) => void;
+	borderColor?: (str: string) => string;
 	getPaddingX?: () => number;
 	setPaddingX?: (padding: number) => void;
 	setAutocompleteMaxVisible?: (max: number) => void;
@@ -2116,6 +2119,9 @@ const FORWARDED_CALLBACKS = [
 	"onExtensionShortcut",
 ] as const;
 
+/** Value properties pi assigns on the top editor; forwarded to the prior. */
+const FORWARDED_PROPERTIES = ["borderColor"] as const;
+
 class DecoratingGhostEditor extends CustomEditor {
 	private suggestionState: SuggestionState;
 	private prior: PriorEditorLike;
@@ -2134,7 +2140,7 @@ class DecoratingGhostEditor extends CustomEditor {
 		// pi wires the app-level callbacks onto the TOP component after the
 		// factory returns — forward every assignment to the prior editor so
 		// its own dispatch path sees the host handlers.
-		for (const prop of FORWARDED_CALLBACKS) {
+		for (const prop of [...FORWARDED_CALLBACKS, ...FORWARDED_PROPERTIES]) {
 			Object.defineProperty(this, prop, {
 				get: () => (this.prior as unknown as Record<string, unknown>)[prop],
 				set: (value: unknown) => {
@@ -2222,6 +2228,16 @@ class DecoratingGhostEditor extends CustomEditor {
 
 	override setText(text: string): void {
 		this.prior.setText(text);
+	}
+
+	// Plain methods (no `override`), same reason as the padding helpers below:
+	// OMP's pinned CustomEditor is the base type we are compiled against.
+	insertTextAtCursor(text: string): void {
+		this.prior.insertTextAtCursor?.(text);
+	}
+
+	addToHistory(text: string): void {
+		this.prior.addToHistory?.(text);
 	}
 
 	// Plain methods (no `override`): OMP's pinned CustomEditor does not
