@@ -263,6 +263,19 @@ describe("loadConfig", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
+	test("T5c: debug is boolean-only; absent means off", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: true }));
+		expect(loadConfig(cwd).debug).toBe(true);
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: false }));
+		expect(loadConfig(cwd).debug).toBe(false);
+		for (const bad of ["on", 1, null]) {
+			writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: bad }));
+			expect(loadConfig(cwd).debug).toBeUndefined();
+		}
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
 	test("T5: both malformed returns empty object", () => {
 		writeFile(tmpHome, "next-prompt.json", "{ broken");
 		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
@@ -2798,6 +2811,25 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.headers).toBeUndefined();
 	});
 
+	test("T74j: no debug log unless config debug:true", async () => {
+		const off = await setup({ branch: [assistantEntry("a")] });
+		await off.fake.handlers.get("agent_settled")!({}, off.fake.ctx);
+		expect(off.fake.calls.complete).toHaveLength(1);
+		expect(existsSync(join(tmpHome, "next-prompt-debug.log"))).toBe(false);
+
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ debug: true }),
+		);
+		const on = await setup({ branch: [assistantEntry("a")] });
+		await on.fake.handlers.get("session_start")!({}, on.fake.ctx);
+		await on.fake.handlers.get("agent_settled")!({}, on.fake.ctx);
+		const log = readFileSync(join(tmpHome, "next-prompt-debug.log"), "utf-8");
+		expect(log).toContain('"event":"compute_go"');
+		expect(log).not.toContain("systemPrompt");
+	});
+
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -4394,6 +4426,26 @@ describe("configureInteractively", () => {
 			},
 		});
 		expect(out?.model).toEqual({ provider: "anthropic", model: "haiku" });
+	});
+
+	test("T119e: debug confirm true → saved; declined → key dropped", async () => {
+		const base = {
+			model: "(use current model)",
+			renderMode: "widget — colored line below the input box",
+			thinking: "(unset — model default)",
+			acceptKey: "alt+/",
+			rearmDelayMs: "2000",
+			maxTranscriptChars: "12000",
+			maxRecentTurns: "",
+			maxSuggestionChars: "320",
+			allowCrossProvider: false,
+		};
+		const onCtx = makeConfigCtx({ answers: { ...base, debug: true } });
+		expect((await configureInteractively(onCtx, {}))?.debug).toBe(true);
+
+		const offCtx = makeConfigCtx({ answers: { ...base, debug: false } });
+		const off = await configureInteractively(offCtx, { debug: true });
+		expect(off?.debug).toBeUndefined();
 	});
 
 	test("T120: cancel at model picker → undefined", async () => {

@@ -125,6 +125,11 @@ export type ThinkingLevel =
 
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
+	/**
+	 * Opt-in diagnostic log (`next-prompt-debug.log`): one JSON line per decision,
+	 * labels + sizes only, never content. Absent means off.
+	 */
+	debug?: boolean;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
 	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "alt+/". */
@@ -472,6 +477,10 @@ function parseConfig(text: string): {
 			case "allowCrossProvider":
 				if (typeof value !== "boolean") failPrivacy("must be a boolean");
 				else cfg.allowCrossProvider = value;
+				break;
+			case "debug":
+				if (typeof value !== "boolean") failPrivacy("must be a boolean");
+				else cfg.debug = value;
 				break;
 			case "allowCrossProviderPairs": {
 				const isValidPair = (p: unknown): p is [string, string] =>
@@ -2497,9 +2506,13 @@ interface NextPromptRef {
 	unsubInput: (() => void) | undefined;
 }
 
-// TEMPORARY ghost-darkness diagnostic (remove before release): one JSON line
-// per decision to next-prompt-debug.log — labels + sizes only, never content.
+// Opt-in diagnostic log (config `debug: true`): one JSON line per decision to
+// next-prompt-debug.log — labels + sizes only, never content. An absent config
+// value means no file is written at all.
+let diagEnabled = false;
+
 function diag(event: string, fields: Record<string, unknown> = {}): void {
+	if (!diagEnabled) return;
 	try {
 		appendFileSync(
 			join(getAgentDir(), "next-prompt-debug.log"),
@@ -2652,6 +2665,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (!isInteractiveContext(ctx)) {
 			ref.state = undefined;
 			effective = undefined;
+			diagEnabled = false;
 			return;
 		}
 
@@ -2675,6 +2689,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			projectTrusted: projectTrustedForHost(ctx),
 			trustAvailable: hostTrustAvailableForHost(ctx),
 		});
+		diagEnabled = effective.debug === true;
 		if (effective.computeDisabled) {
 			ctx.ui.notify(
 				"next-prompt: invalid privacy-sensitive config; suggestions disabled",
@@ -2780,6 +2795,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				projectTrusted: projectTrustedForHost(ctx),
 				trustAvailable: hostTrustAvailableForHost(ctx),
 			});
+			diagEnabled = effective.debug === true;
 			if (effective.computeDisabled) return;
 			if (host === "pi" && !ctx.isIdle()) return;
 			if (ctx.ui.getEditorText().length > 0) return;
@@ -2807,6 +2823,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput = undefined;
 		ref.state = undefined;
 		effective = undefined;
+		diagEnabled = false;
 	});
 
 	async function maybeCompute(
@@ -3371,6 +3388,14 @@ export async function configureInteractively(
 		"Yes = use the configured model even if it's on a different provider (requires per-project consent). No = fall back to the current model.",
 	);
 	update.allowCrossProvider = cross;
+
+	// 10. debug (confirm, opt-in). Absent means off; declining clears a saved
+	// true so the file returns to the default.
+	const debugPick = await ctx.ui.confirm(
+		`next-prompt: write the diagnostic log (next-prompt-debug.log)? [${current.debug ? "on" : "off"}]`,
+		"Entries are labels and sizes only — never transcript or suggestion text. Off = no log file is written.",
+	);
+	if (typeof debugPick === "boolean") update.debug = debugPick ? true : undefined;
 
 	return update;
 }

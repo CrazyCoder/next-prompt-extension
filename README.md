@@ -152,6 +152,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
+| `debug` | `false` (absent) | When `true`, appends one JSON line per decision to `<agent dir>/next-prompt-debug.log`: event name, model, transcript/response **sizes**, stop reason, token counts — never transcript or suggestion text. Absent or `false` means no file is written at all. Toggled by the last step of `/next-prompt-config`. |
 
 ### Why `alt+/` is the default accept key
 
