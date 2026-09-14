@@ -33,6 +33,24 @@ status report — describes **this extension's rendered line only**. It is not a
 instruction for a coding agent's own messages, and reading it must never lead an agent
 to append prompt-shaped "suggestion" lines to its replies.
 
+## Manual trigger (`autoTrigger: false`)
+
+By default suggestions are computed automatically after every settled turn. Set
+`autoTrigger` to `false` to switch to **manual-only** mode: nothing is computed
+automatically, and the accept key doubles as the trigger —
+
+1. press **`Alt-/`** once → compute the next-prompt suggestion;
+2. press **`Alt-/`** again (once it is shown) → accept it into the input box;
+3. press **`Alt-/`** while a suggestion is being generated → ignored (no-op; never
+   two concurrent requests).
+
+```json
+{ "autoTrigger": false }
+```
+
+When `autoTrigger` is `true` (the default), the accept key still triggers a fresh
+computation whenever no suggestion is currently showing.
+
 ## Install
 
 Pi and OMP auto-discover extensions from standard locations.
@@ -142,6 +160,7 @@ comes from the host's `CONFIG_DIR_NAME`:
   "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
   "thinking": "low",
   "acceptKey": "alt+/",
+  "autoTrigger": false,
   "renderMode": "both",
   "rearmDelayMs": 2000,
   "maxTranscriptChars": 12000,
@@ -156,6 +175,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `model` | current model (`ctx.model`) | `{ provider, model, sessionId? }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. For `opencode`/`opencode-go` the wizard also stores a `sessionId`, sent as the `x-opencode-session` header that gateway requires (it answers `400 MissingSessionID` without one); it is minted once per model and reused, so suggestions keep a stable route across sessions. Other providers ignore it. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
+| `autoTrigger` | `true` | When `true` (default), suggestions are computed automatically after every settled turn. When `false`, manual-only: the accept key doubles as the manual trigger (first press generates, second press accepts, in-flight press is a no-op). |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/next-prompt-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |

@@ -1540,6 +1540,7 @@ describe("real pi-tui editor integration", () => {
 			renderGhost: undefined,
 			fallbackToWidget: undefined,
 			abortInflight: () => {},
+			isComputing: () => false,
 			...over,
 		};
 	}
@@ -1832,6 +1833,8 @@ function makeFake(opts: {
 	selectUnavailable?: boolean;
 	/** ctx.sessionManager.getSessionId() value (Pi exposes it). */
 	sessionId?: string;
+	/** complete() returns a pending promise; tests resolve it via resolveComplete. */
+	deferredComplete?: boolean;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -1874,6 +1877,11 @@ function makeFake(opts: {
 	requestRenderCalls: number;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
+	/** Resolve a deferred complete() promise (deferredComplete mode). */
+	resolveComplete: (result?: {
+		content: Array<{ type: "text"; text: string }>;
+		stopReason: string;
+	}) => void;
 } {
 	let idle = opts.idle ?? true;
 	const calls = {
@@ -1912,6 +1920,7 @@ function makeFake(opts: {
 		: undefined;
 	let requestRenderCalls = 0;
 	let lastEditorComponent: unknown;
+	let completeResolver: ((v: unknown) => void) | undefined;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
 	editor.focused = true;
@@ -1946,6 +1955,11 @@ function makeFake(opts: {
 					headers: options?.headers,
 				});
 				if (opts.completeError) throw opts.completeError;
+				if (opts.deferredComplete) {
+					return new Promise((resolve) => {
+						completeResolver = resolve;
+					});
+				}
 				return (
 					opts.completeResult ?? {
 						content: [{ type: "text" as const, text: "suggestion" }],
@@ -2112,6 +2126,18 @@ function makeFake(opts: {
 		handlers,
 		setIdle: (v: boolean) => {
 			idle = v;
+		},
+		resolveComplete: (
+			result?: {
+				content: Array<{ type: "text"; text: string }>;
+				stopReason: string;
+			},
+		) => {
+			completeResolver?.({
+				content: [{ type: "text", text: "suggestion" }],
+				stopReason: "stop",
+				...result,
+			});
 		},
 	};
 }
@@ -3278,13 +3304,95 @@ describe("accept handler (onTerminalInput)", () => {
 		expect(fake.editorText).toBe("already typed");
 	});
 
-	test("T97: accept key with no suggestion → not consumed", async () => {
+	test("T97: accept key with no suggestion → manually triggers a new computation", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// No suggestion computed (default completeResult text "suggestion" — but clear it first)
+		expect(fake.calls.complete).toHaveLength(1);
+		// Clear the suggestion (emulates a dismissed/cleared state). The accept
+		// key now doubles as the manual trigger and starts a fresh computation.
 		fake.handlers.get("input")!({}, fake.ctx);
 		const result = fake.inputHandler!("\x1b/");
-		expect(result).toBeUndefined();
+		expect(result).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(2);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Manual trigger (autoTrigger off): the accept key doubles as the trigger —
+// first press generates, second press accepts, an in-flight press is a no-op.
+// ---------------------------------------------------------------------------
+
+describe("manual trigger (autoTrigger off)", () => {
+	test("M1: agent_settled with autoTrigger=false does not auto-compute", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("M2: accept key with autoTrigger=false manually computes a suggestion", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("M3: accept key while computing is ignored (no concurrent request)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			deferredComplete: true,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// First press starts a deferred computation.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+		// Second press while in flight: swallowed, no new request.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+		// Resolve; the suggestion then renders.
+		fake.resolveComplete();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion");
+	});
+
+	test("M4: manual trigger then accept — second press fills the editor", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "next thing" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// First press: generate.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(fake.widgetContent?.[0] ?? "").toContain("next thing");
+		// Second press: accept into the editor.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.editorText).toBe("next thing");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 });
 

@@ -43,6 +43,17 @@ Run each sequence in `widget`, `ghost`, and `both`:
   renders (no consent persisted, no model call);
 - [ ] delete-to-empty after dismissing with Escape does NOT re-arm.
 
+### Manual trigger (`autoTrigger: false`)
+
+- [ ] With `autoTrigger: false`, no suggestion appears after a settled turn.
+- [ ] Press `Alt-/` with an empty editor → a suggestion appears.
+- [ ] Press `Alt-/` again → the suggestion fills the editor exactly once (key
+  swallowed, no `/` typed).
+- [ ] Press `Alt-/` while a suggestion is being generated → no-op (no second
+  request, editor untouched).
+- [ ] With `autoTrigger: true` (default), dismissing a suggestion then pressing
+  `Alt-/` recomputes a fresh one.
+
 ### Autocomplete / conflicting keys
 
 - [ ] Slash/path autocomplete still works (Tab, up/down, Enter) while a
