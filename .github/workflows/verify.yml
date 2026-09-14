@@ -170,9 +170,11 @@ jobs:
         env:
           PI_OFFLINE: "1"
         run: |
-          mkdir -p /tmp/np-extracted
-          tar -xzf /tmp/np-pack/gamaraan-next-prompt-*.tgz -C /tmp/np-extracted
-          pi install /tmp/np-extracted/package
+          # pi list prints the install spec (this path), not package.json "name",
+          # so the extracted directory must carry the package name for the assertion below.
+          mkdir -p /tmp/np-extracted/next-prompt
+          tar -xzf /tmp/np-pack/gamaraan-next-prompt-*.tgz -C /tmp/np-extracted/next-prompt
+          pi install /tmp/np-extracted/next-prompt/package
 
       - name: Assert the extension is registered
         env:
