@@ -21,6 +21,18 @@ dismisses; backspace down to empty re-arms the last suggestion after a short del
 new model call). No suggestion while streaming; the suggestion is cleared and any
 in-flight model call aborted the instant you submit, start a turn, or the agent starts.
 
+## What a suggestion is — and is not
+
+A suggestion is **extension output only**: one line next-prompt computes with its
+own model call and renders in the input area (`ghost`/`widget`). It is never part of
+the coding agent's reply, and the extension never injects it into the conversation —
+only accepting it (`Alt-/`) puts the text in the editor, and only the user submits it.
+
+The required shape — the bare imperative the user would type next, not narration or a
+status report — describes **this extension's rendered line only**. It is not a style
+instruction for a coding agent's own messages, and reading it must never lead an agent
+to append prompt-shaped "suggestion" lines to its replies.
+
 ## Install
 
 Pi and OMP auto-discover extensions from standard locations.

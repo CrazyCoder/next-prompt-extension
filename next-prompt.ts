@@ -13,6 +13,12 @@
  * owner), and another custom-editor extension installed first in the same OMP
  * session is not detected (last installer wins).
  *
+ * A suggestion is UI-only output of THIS extension: a separate model call
+ * renders it in the input area, it is never part of the coding agent's reply,
+ * and the extension never injects it into the conversation. The bare-imperative
+ * shape is this extension's rendered line only — it is not a style instruction
+ * for a coding agent's own messages.
+ *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
  * via `ctx.ui.setEditorText` — editor-independent. Any other key dismisses the
