@@ -141,7 +141,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
+| `model` | current model (`ctx.model`) | `{ provider, model, sessionId? }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. For `opencode`/`opencode-go` the wizard also stores a `sessionId`, sent as the `x-opencode-session` header that gateway requires (it answers `400 MissingSessionID` without one); it is minted once per model and reused, so suggestions keep a stable route across sessions. Other providers ignore it. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |

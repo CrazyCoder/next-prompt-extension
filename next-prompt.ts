@@ -62,6 +62,7 @@ import {
 	chmodSync,
 	rmSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import {
@@ -96,6 +97,14 @@ import type {
 export interface NextPromptModelConfig {
 	provider: string;
 	model: string;
+	/**
+	 * OpenCode gateway session id, sent as `x-opencode-session`. The gateway
+	 * rejects requests without it (HTTP 400 MissingSessionID) and pi injects it
+	 * for its own turns only, so an extension-initiated completion needs one of
+	 * its own. Minted by the config wizard for `opencode`/`opencode-go` models;
+	 * ignored by every other provider.
+	 */
+	sessionId?: string;
 }
 
 export type RenderMode = "widget" | "ghost" | "both";
@@ -226,6 +235,8 @@ export const DEFAULT_ACCEPT_KEY = "alt+/";
 export const DEFAULT_REARM_MS = 2000;
 
 const MIN_REARM_DELAY = 50;
+/** Upper bound on a stored OpenCode session id (header hygiene). */
+export const MAX_SESSION_ID_CHARS = 200;
 const MIN_TRANSCRIPT_CHARS = 500;
 const MIN_SUGGESTION_CHARS = 1;
 const MAX_TRANSCRIPT_CHARS = 500_000;
@@ -439,9 +450,17 @@ function parseConfig(text: string): {
 				) {
 					failPrivacy("must be { provider, model }");
 				} else {
+					const model = m as NextPromptModelConfig;
+					const sessionId = model.sessionId;
 					cfg.model = {
-						provider: (m as NextPromptModelConfig).provider,
-						model: (m as NextPromptModelConfig).model,
+						provider: model.provider,
+						model: model.model,
+						...(typeof sessionId === "string" &&
+						sessionId.length > 0 &&
+						sessionId.length <= MAX_SESSION_ID_CHARS &&
+						!sessionId.includes("\n")
+							? { sessionId }
+							: {}),
 					};
 				}
 				break;
@@ -836,6 +855,11 @@ export function revokeConsent(
 	} catch (err) {
 		console.warn(`next-prompt: failed to revoke consent: ${err}`);
 	}
+}
+
+/** Providers whose gateway requires the OpenCode session header. */
+export function isOpencodeProvider(provider: string): boolean {
+	return provider === "opencode" || provider === "opencode-go";
 }
 
 /** Format a model for the config-command picker: "provider/model — name". */
@@ -2357,6 +2381,7 @@ export interface HostCtx extends HostContextLike {
 				 * so the extension must send the wire-level key itself. */
 				reasoningEffort?: ThinkingLevel;
 				maxTokens?: number;
+				headers?: Record<string, string>;
 			},
 		) => Promise<AssistantMessage>;
 		/** OMP auth resolver (absent on Pi). */
@@ -2400,6 +2425,8 @@ export interface HostCtx extends HostContextLike {
 		getBranch(): BranchEntry[];
 		/** Compaction-aware effective context (Pi exposes it; optional elsewhere). */
 		buildSessionContext?: () => { messages?: unknown[] };
+		/** Current session id (Pi exposes it); needed for the OpenCode session header. */
+		getSessionId?: () => string | undefined;
 	};
 	reload?: () => Promise<void>;
 }
@@ -2977,6 +3004,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				signal: ac.signal,
 				reasoning: effective.thinking,
 				maxTokens: suggestionMaxTokens(effective),
+				opencodeSessionId: effective.model?.sessionId,
 			});
 		} catch (err) {
 			if (!ac.signal.aborted) {
@@ -2987,6 +3015,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		diag("complete_done", {
 			sr: resp?.stopReason,
 			out: resp?.usage?.output,
+			err: resp?.errorMessage,
 		});
 		if (ac.signal.aborted || generation !== state.inputGeneration) return;
 		if (resp === undefined) return; // transport unavailable; diagnostic already shown
@@ -3080,6 +3109,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			signal?: AbortSignal;
 			reasoning?: ThinkingLevel;
 			maxTokens?: number;
+			/** `model.sessionId` from config (OpenCode gateway routing). */
+			opencodeSessionId?: string;
 		},
 	): Promise<AssistantMessage | undefined> {
 		if (hostKind === "pi") {
@@ -3092,6 +3123,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				signal: options.signal,
 				reasoningEffort: options.reasoning,
 				maxTokens: options.maxTokens,
+				headers: opencodeSessionHeaders(
+					model,
+					ctx,
+					options.opencodeSessionId,
+				),
 			});
 		}
 		const mod = await loadOmpCompletionModule();
@@ -3108,6 +3144,37 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			reasoning: options.reasoning,
 			maxTokens: options.maxTokens,
 		});
+	}
+
+	/**
+	 * OpenCode's gateway rejects requests that carry no `x-opencode-session`
+	 * (HTTP 400 MissingSessionID). Pi's own agent loop injects that header for
+	 * its turns only, so an extension-initiated completion must send it itself
+	 * (verified 2026-09-14 against opencode-go/deepseek-v4.1-flash: without it
+	 * the call returns 400 in ~250ms with zero output tokens). The config's own
+	 * session id wins so suggestions keep a stable route across sessions;
+	 * without one the host session id is used.
+	 */
+	function opencodeSessionHeaders(
+		model: Model<Api>,
+		ctx: HostCtx,
+		configuredSessionId?: string,
+	): Record<string, string> | undefined {
+		let host = "";
+		try {
+			host = new URL(model.baseUrl ?? "").host;
+		} catch {
+			/* not a URL — fall back to the provider id check */
+		}
+		const isOpencode =
+			isOpencodeProvider(model.provider) ||
+			host === "opencode.ai" ||
+			host.endsWith(".opencode.ai");
+		if (!isOpencode) return undefined;
+		const sessionId = configuredSessionId || ctx.sessionManager.getSessionId?.();
+		return sessionId
+			? { "x-opencode-session": sessionId, "x-opencode-client": "pi" }
+			: undefined;
 	}
 
 	// Interactive config command: `/next-prompt-config`. Walks the user through
@@ -3193,7 +3260,21 @@ export async function configureInteractively(
 	);
 	if (modelPick === undefined) return undefined;
 	if (modelPick === "(use current model)") update.model = undefined;
-	else update.model = parseModelOption(modelPick);
+	else {
+		const picked = parseModelOption(modelPick);
+		if (picked && isOpencodeProvider(picked.provider)) {
+			// OpenCode gateways need their own session id; keep the configured one
+			// when the picker returns the same model, otherwise mint a stable one
+			// so the choice survives restarts.
+			const keep =
+				current.model?.provider === picked.provider &&
+				current.model.model === picked.model
+					? current.model.sessionId
+					: undefined;
+			picked.sessionId = keep ?? randomUUID();
+		}
+		update.model = picked;
+	}
 
 	// 2. renderMode — ghost first (nicer, inline in the box), then widget (reliable
 	// below-editor line), then both.

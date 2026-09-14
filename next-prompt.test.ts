@@ -43,6 +43,7 @@ import {
 	loadConfig,
 	loadEffectiveConfig,
 	matchesAcceptKeyRaw,
+	MAX_SESSION_ID_CHARS,
 	overlayGhost,
 	parseModelOption,
 	projectTrustedForHost,
@@ -223,6 +224,42 @@ describe("loadConfig", () => {
 		writeFile(cwd, ".pi/next-prompt.json", "{ broken");
 		const cfg = loadConfig(cwd);
 		expect(cfg.maxSuggestionChars).toBe(7);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("T5b: model.sessionId round-trips; malformed ids are dropped", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({
+				model: {
+					provider: "opencode-go",
+					model: "deepseek-v4.1-flash",
+					sessionId: "8f1c0b6e-0000-4000-8000-000000000000",
+				},
+			}),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		expect(loadConfig(cwd).model).toEqual({
+			provider: "opencode-go",
+			model: "deepseek-v4.1-flash",
+			sessionId: "8f1c0b6e-0000-4000-8000-000000000000",
+		});
+		rmSync(cwd, { recursive: true, force: true });
+
+		for (const bad of [42, "", "x".repeat(MAX_SESSION_ID_CHARS + 1), "a\nb"]) {
+			writeFile(
+				tmpHome,
+				"next-prompt.json",
+				JSON.stringify({
+					model: { provider: "opencode-go", model: "m", sessionId: bad },
+				}),
+			);
+			expect(loadConfig(cwd).model).toEqual({
+				provider: "opencode-go",
+				model: "m",
+			});
+		}
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
@@ -1780,6 +1817,8 @@ function makeFake(opts: {
 	selectCall?: () => void;
 	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
 	selectUnavailable?: boolean;
+	/** ctx.sessionManager.getSessionId() value (Pi exposes it). */
+	sessionId?: string;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -1806,6 +1845,7 @@ function makeFake(opts: {
 			reasoning?: string;
 			reasoningEffort?: string;
 			maxTokens?: number;
+			headers?: Record<string, string>;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -1832,6 +1872,7 @@ function makeFake(opts: {
 			reasoning?: string;
 			reasoningEffort?: string;
 			maxTokens?: number;
+			headers?: Record<string, string>;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -1878,6 +1919,7 @@ function makeFake(opts: {
 					reasoning?: string;
 					reasoningEffort?: string;
 					maxTokens?: number;
+					headers?: Record<string, string>;
 				},
 			) => {
 				calls.complete.push({
@@ -1888,6 +1930,7 @@ function makeFake(opts: {
 					reasoning: options?.reasoning,
 					reasoningEffort: options?.reasoningEffort,
 					maxTokens: options?.maxTokens,
+					headers: options?.headers,
 				});
 				if (opts.completeError) throw opts.completeError;
 				return (
@@ -1991,7 +2034,10 @@ function makeFake(opts: {
 				);
 			},
 		},
-		sessionManager: { getBranch: () => opts.branch ?? [] },
+		sessionManager: {
+			getBranch: () => opts.branch ?? [],
+			getSessionId: () => opts.sessionId,
+		},
 	};
 	const pi = {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
@@ -2673,6 +2719,83 @@ describe("controller wiring (agent_settled)", () => {
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete[0]!.reasoningEffort).toBeUndefined();
+	});
+
+	test("T74g: opencode-go carries the session header (400 MissingSessionID otherwise)", async () => {
+		const configured = {
+			provider: "opencode-go",
+			id: "deepseek-v4.1-flash",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "sid-1",
+			findModel: (p, m) =>
+				p === "opencode-go" && m === "deepseek-v4.1-flash"
+					? configured
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "opencode-go", model: "deepseek-v4.1-flash" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toEqual({
+			"x-opencode-session": "sid-1",
+			"x-opencode-client": "pi",
+		});
+	});
+
+	test("T74i: model.sessionId in config wins over the host session id", async () => {
+		const configured = {
+			provider: "opencode-go",
+			id: "deepseek-v4.1-flash",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "host-sid",
+			findModel: (p, m) =>
+				p === "opencode-go" && m === "deepseek-v4.1-flash"
+					? configured
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: {
+					provider: "opencode-go",
+					model: "deepseek-v4.1-flash",
+					sessionId: "cfg-sid",
+				},
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toEqual({
+			"x-opencode-session": "cfg-sid",
+			"x-opencode-client": "pi",
+		});
+	});
+
+	test("T74h: non-opencode models get no injected headers", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "sid-1",
+		});
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toBeUndefined();
 	});
 
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
@@ -4221,6 +4344,56 @@ describe("configureInteractively", () => {
 			maxSuggestionChars: 200,
 			allowCrossProvider: false,
 		});
+	});
+
+	test("T119b: opencode-go pick mints and stores a session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "opencode-go", id: "deepseek-v4.1-flash" }],
+			answers: {
+				model: "opencode-go/deepseek-v4.1-flash — deepseek-v4.1-flash",
+			},
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out?.model?.provider).toBe("opencode-go");
+		expect(out?.model?.model).toBe("deepseek-v4.1-flash");
+		expect(typeof out?.model?.sessionId).toBe("string");
+		expect((out?.model?.sessionId ?? "").length).toBeGreaterThan(10);
+	});
+
+	test("T119c: re-picking the same opencode-go model keeps its session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "opencode-go", id: "deepseek-v4.1-flash" }],
+			answers: {
+				model: "opencode-go/deepseek-v4.1-flash — deepseek-v4.1-flash",
+			},
+		});
+		const out = await configureInteractively(ctx, {
+			model: {
+				provider: "opencode-go",
+				model: "deepseek-v4.1-flash",
+				sessionId: "keep-me",
+			},
+		});
+		expect(out?.model).toEqual({
+			provider: "opencode-go",
+			model: "deepseek-v4.1-flash",
+			sessionId: "keep-me",
+		});
+	});
+
+	test("T119d: switching away from opencode-go drops the session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "anthropic", id: "haiku" }],
+			answers: { model: "anthropic/haiku — haiku" },
+		});
+		const out = await configureInteractively(ctx, {
+			model: {
+				provider: "opencode-go",
+				model: "deepseek-v4.1-flash",
+				sessionId: "old",
+			},
+		});
+		expect(out?.model).toEqual({ provider: "anthropic", model: "haiku" });
 	});
 
 	test("T120: cancel at model picker → undefined", async () => {
