@@ -116,13 +116,13 @@ checks.
 
 ## Record
 
-- Date:
-- Pi version(s):
-- OMP version(s):
-- Terminal emulators:
-- Configured render mode:
-- Provider/model:
-- Results / failures:
+- Date: 2026-09-15
+- Pi version(s): 0.85.1
+- OMP version(s): 18.1.21
+- Terminal emulators: kitty
+- Configured render mode: ghost
+- Provider/model: opencode-go/deepseek-v4.1-flash
+- Results / failures: all cases pass
 
 ## Release evidence (Step 7 gate)
 
@@ -136,3 +136,5 @@ Recorded: vX.Y.Z — YYYY-MM-DD — Pi <version> (<terminals>) / OMP <version> (
 
 If any case failed, do NOT append the line — fix first (a failed case is a
 release blocker per the status legend).
+
+Recorded: v0.3.0 — 2026-09-15 — Pi 0.85.1 (kitty) / OMP 18.1.21 (kitty) — all cases pass
