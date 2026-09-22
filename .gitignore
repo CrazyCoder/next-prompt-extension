@@ -1,2 +1,4 @@
 node_modules/
 package-lock.json
+.pi/
+ADVERSARIAL_FIX_PLAN.md

@@ -44,6 +44,17 @@ Run each sequence in `widget`, `ghost`, and `both`:
   renders (no consent persisted, no model call);
 - [ ] delete-to-empty after dismissing with Escape does NOT re-arm.
 
+### Manual trigger (`autoTrigger: false`)
+
+- [ ] With `autoTrigger: false`, no suggestion appears after a settled turn.
+- [ ] Press `Alt-/` with an empty editor → a suggestion appears.
+- [ ] Press `Alt-/` again → the suggestion fills the editor exactly once (key
+  swallowed, no `/` typed).
+- [ ] Press `Alt-/` while a suggestion is being generated → no-op (no second
+  request, editor untouched).
+- [ ] With `autoTrigger: true` (default), dismissing a suggestion then pressing
+  `Alt-/` recomputes a fresh one.
+
 ### Autocomplete / conflicting keys
 
 - [ ] Slash/path autocomplete still works (Tab, up/down, Enter) while a
@@ -106,10 +117,25 @@ checks.
 
 ## Record
 
-- Date:
-- Pi version(s):
-- OMP version(s):
-- Terminal emulators:
-- Configured render mode:
-- Provider/model:
-- Results / failures:
+- Date: 2026-09-15
+- Pi version(s): 0.85.1
+- OMP version(s): 18.1.21
+- Terminal emulators: kitty
+- Configured render mode: ghost
+- Provider/model: opencode-go/deepseek-v4.1-flash
+- Results / failures: all cases pass
+
+## Release evidence (Step 7 gate)
+
+Tag publishing REQUIRES a dated evidence line for the exact released version
+(`publish.yml` greps for it; without it the tag cannot publish). Append one
+line here after every full pass, in exactly this format:
+
+```
+Recorded: vX.Y.Z — YYYY-MM-DD — Pi <version> (<terminals>) / OMP <version> (<terminals>) — all cases pass
+```
+
+If any case failed, do NOT append the line — fix first (a failed case is a
+release blocker per the status legend).
+
+Recorded: v0.3.0 — 2026-09-15 — Pi 0.85.1 (kitty) / OMP 18.1.21 (kitty) — all cases pass

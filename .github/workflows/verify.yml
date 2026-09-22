@@ -1,0 +1,186 @@
+# Reusable verification path — the SINGLE source of truth for what "checked"
+# means. Invoked by:
+#   - test.yml    (pull_request)
+#   - publish.yml (tag publishing) — guarantees a tag can never publish with
+#     checks weaker than PR CI (Step 7 acceptance).
+name: verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # Current dev-dependency versions (pi 0.85.1 / OMP 17.2.13): both
+  # typechecks, the full unit suite, and the exact-contents package check.
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (pi current)
+        run: bun run typecheck
+
+      - name: Typecheck (OMP current)
+        run: bun run typecheck:omp
+
+      - name: Run unit suite (Pi + OMP-shaped fixtures)
+        run: bun test
+
+      # Asserts the exact package file list (Step 7 item 4: no extra, no
+      # missing).
+      - name: Verify package contents (exact list)
+        run: bun run verify:package
+
+  # Pi minimum/current compatibility matrix (Step 7 item 2). peerDependencies
+  # are wildcard, so the extension must keep passing against the oldest
+  # supported and the current published pi packages — the automated evidence
+  # for the support range documented in README.md.
+  compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version: ["0.84.0", "0.85.1"] # oldest supported / current
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Pin pi packages to ${{ matrix.pi-version }}
+        run: |
+          bun add -d \
+            @earendil-works/pi-ai@${{ matrix.pi-version }} \
+            @earendil-works/pi-coding-agent@${{ matrix.pi-version }} \
+            @earendil-works/pi-tui@${{ matrix.pi-version }}
+
+      - name: Typecheck against pi ${{ matrix.pi-version }}
+        run: bun run typecheck
+
+      - name: Run unit tests against pi ${{ matrix.pi-version }}
+        run: bun test
+
+  # OMP minimum/current compatibility matrix: typecheck against the pinned
+  # @oh-my-pi/* API surface (dev-only test deps, never peerDependencies), the
+  # full unit suite, and the PACKED ARTIFACT installed into an isolated OMP
+  # profile with a clean `omp plugin doctor` (Step 7 item 3).
+  omp-compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        omp-version: ["17.2.12", "17.2.13"] # oldest supported / current
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Pin @oh-my-pi packages to ${{ matrix.omp-version }}
+        run: |
+          bun add -d \
+            @oh-my-pi/pi-ai@${{ matrix.omp-version }} \
+            @oh-my-pi/pi-coding-agent@${{ matrix.omp-version }} \
+            @oh-my-pi/pi-tui@${{ matrix.omp-version }}
+
+      - name: Typecheck against OMP ${{ matrix.omp-version }} API types
+        run: bun run typecheck:omp
+
+      - name: Run unit suite (Pi + OMP-shaped fixtures)
+        run: bun test
+
+      - name: Pack the extension artifact
+        run: |
+          mkdir -p /tmp/np-pack
+          npm pack --pack-destination /tmp/np-pack
+
+      - name: Install the packed artifact into an isolated OMP profile
+        run: |
+          mkdir -p /tmp/np-extracted
+          tar -xzf /tmp/np-pack/jetserge-next-prompt-*.tgz -C /tmp/np-extracted
+          OMP_PROFILE=next-prompt-ci ./node_modules/.bin/omp plugin install /tmp/np-extracted/package
+
+      - name: Require zero plugin errors via omp plugin doctor
+        run: |
+          OMP_PROFILE=next-prompt-ci ./node_modules/.bin/omp plugin doctor --json > /tmp/doctor.json
+          cat /tmp/doctor.json
+          errors=$(jq '[.[] | select(.status == "error")] | length' /tmp/doctor.json)
+          if [ "$errors" -ne 0 ]; then
+            echo "omp plugin doctor reported $errors error(s)"; exit 1
+          fi
+
+  # Pi packed-artifact check (Step 7 item 3 — both hosts): the tarball must
+  # install through pi's own package manager into a clean agent dir.
+  pi-artifact:
+    runs-on: ubuntu-latest
+    env:
+      PI_VERSION: "0.85.1" # current
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Pack the extension artifact
+        run: |
+          mkdir -p /tmp/np-pack
+          npm pack --pack-destination /tmp/np-pack
+
+      - name: Install the pi binary (v${{ env.PI_VERSION }})
+        run: npm install -g @earendil-works/pi-coding-agent@${{ env.PI_VERSION }}
+
+      - name: Install the packed artifact through pi
+        env:
+          PI_OFFLINE: "1"
+        run: |
+          # pi list prints the install spec (this path), not package.json "name",
+          # so the extracted directory must carry the package name for the assertion below.
+          mkdir -p /tmp/np-extracted/next-prompt
+          tar -xzf /tmp/np-pack/jetserge-next-prompt-*.tgz -C /tmp/np-extracted/next-prompt
+          pi install /tmp/np-extracted/next-prompt/package
+
+      - name: Assert the extension is registered
+        env:
+          PI_OFFLINE: "1"
+        run: |
+          pi list
+          pi list | grep -q "next-prompt" || {
+            echo "packed artifact is not registered with pi"; exit 1;
+          }

@@ -43,6 +43,7 @@ import {
 	loadConfig,
 	loadEffectiveConfig,
 	matchesAcceptKeyRaw,
+	MAX_SESSION_ID_CHARS,
 	overlayGhost,
 	parseModelOption,
 	projectTrustedForHost,
@@ -54,10 +55,10 @@ import {
 	setOmpCompletionModuleForTests,
 	shouldTrigger,
 	suggestionCodePointCap,
+	suggestionMaxTokens,
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
-	type HostKind,
 	type NextPromptConfig,
 	type OmpCompletionModule,
 	type SuggestionCtx,
@@ -226,6 +227,55 @@ describe("loadConfig", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
+	test("T5b: model.sessionId round-trips; malformed ids are dropped", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({
+				model: {
+					provider: "opencode-go",
+					model: "deepseek-v4.1-flash",
+					sessionId: "8f1c0b6e-0000-4000-8000-000000000000",
+				},
+			}),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		expect(loadConfig(cwd).model).toEqual({
+			provider: "opencode-go",
+			model: "deepseek-v4.1-flash",
+			sessionId: "8f1c0b6e-0000-4000-8000-000000000000",
+		});
+		rmSync(cwd, { recursive: true, force: true });
+
+		for (const bad of [42, "", "x".repeat(MAX_SESSION_ID_CHARS + 1), "a\nb"]) {
+			writeFile(
+				tmpHome,
+				"next-prompt.json",
+				JSON.stringify({
+					model: { provider: "opencode-go", model: "m", sessionId: bad },
+				}),
+			);
+			expect(loadConfig(cwd).model).toEqual({
+				provider: "opencode-go",
+				model: "m",
+			});
+		}
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("T5c: debug is boolean-only; absent means off", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: true }));
+		expect(loadConfig(cwd).debug).toBe(true);
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: false }));
+		expect(loadConfig(cwd).debug).toBe(false);
+		for (const bad of ["on", 1, null]) {
+			writeFile(tmpHome, "next-prompt.json", JSON.stringify({ debug: bad }));
+			expect(loadConfig(cwd).debug).toBeUndefined();
+		}
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
 	test("T5: both malformed returns empty object", () => {
 		writeFile(tmpHome, "next-prompt.json", "{ broken");
 		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
@@ -363,12 +413,28 @@ describe("destination identity", () => {
 		expect(pairAllowed([], "openai", "anthropic")).toBe(false);
 	});
 
-	test("P2: consent labels tolerate whitespace/ANSI and symbolic values", () => {
-		expect(consentChoiceFromLabel("once")).toBe("once");
-		expect(consentChoiceFromLabel("  Allow once (this project)  ")).toBe("once");
+	test("P2: consent labels tolerate whitespace/ANSI and symbolic values (Step 4 durations)", () => {
+		// Internal ids pass through; the legacy "once" id maps to the
+		// least-persistent duration (F-12: "allow once" never persists).
+		expect(consentChoiceFromLabel("request")).toBe("request");
+		expect(consentChoiceFromLabel("session")).toBe("session");
+		expect(consentChoiceFromLabel("project")).toBe("project");
+		expect(consentChoiceFromLabel("always")).toBe("always");
+		expect(consentChoiceFromLabel("decline")).toBe("decline");
+		expect(consentChoiceFromLabel("once")).toBe("request");
+		// Real selector labels (with ANSI/whitespace tolerance).
+		expect(consentChoiceFromLabel("  Allow this once  ")).toBe("request");
+		expect(consentChoiceFromLabel("Allow for this session")).toBe("session");
+		expect(consentChoiceFromLabel("Always allow (this project)")).toBe("project");
 		expect(
-			consentChoiceFromLabel("\x1b[36mAlways allow for this provider pair\x1b[0m"),
+			consentChoiceFromLabel(
+				"\x1b[36mAlways allow for this provider pair (global)\x1b[0m",
+			),
 		).toBe("always");
+		// Legacy pre-Step-4 label stays recognized.
+		expect(consentChoiceFromLabel("Always allow for this provider pair")).toBe(
+			"always",
+		);
 		expect(consentChoiceFromLabel(" Decline ")).toBe("decline");
 		expect(consentChoiceFromLabel(undefined)).toBeUndefined();
 	});
@@ -657,7 +723,7 @@ describe("resolveSuggestionModel", () => {
 		expect(notifies).toHaveLength(1);
 	});
 
-	test("T14: allowCrossProvider=false + different destination returns ctx.model, no notify", () => {
+	test("T14: allowCrossProvider=false + different destination warns once, returns ctx.model", () => {
 		const active = { provider: "openai", id: "gpt" };
 		const notifies: string[] = [];
 		const ctx = makeCtx({
@@ -676,7 +742,9 @@ describe("resolveSuggestionModel", () => {
 			model: active,
 			crossDestination: false,
 		});
-		expect(notifies).toHaveLength(0);
+		// F-10: fallback is announced once instead of staying silent.
+		expect(notifies).toHaveLength(1);
+		expect(notifies[0]).toContain("different destination");
 	});
 
 	test("T15: allowCrossProvider=false + same destination returns configured model", () => {
@@ -1007,7 +1075,7 @@ describe("buildTranscript", () => {
 		const branch = [userEntry("line1\nline2")];
 		expect(buildTranscript(branch, {})).toBe("User: line1\nline2");
 	});
-	test("T32b: maxRecentTurns keeps only the last N message entries (F-11)", () => {
+	test("T32b: maxRecentTurns keeps the last N user-led exchanges (F-11)", () => {
 		const branch = [
 			userEntry("q1"),
 			assistantEntry("a1"),
@@ -1016,7 +1084,7 @@ describe("buildTranscript", () => {
 			assistantEntry("a2"),
 		];
 		const out = buildTranscript(branch, { maxRecentTurns: 2 });
-		expect(out).toBe("User: q2\nAssistant: a2");
+		expect(out).toBe("User: q1\nAssistant: a1\nUser: q2\nAssistant: a2");
 	});
 	test("T32c: maxRecentTurns larger than branch keeps everything (F-11)", () => {
 		const branch = [userEntry("q1"), assistantEntry("a1")];
@@ -1028,7 +1096,7 @@ describe("buildTranscript", () => {
 		const branch = [userEntry("q1"), assistantEntry("a1"), userEntry("q2")];
 		expect(buildTranscript(branch, { maxRecentTurns: 1 })).toBe("User: q2");
 	});
-	test("T32e: toolResult entries between kept messages stay excluded (F-11)", () => {
+	test("T32e: exchange window keeps its initiating user request (F-11)", () => {
 		const branch = [
 			userEntry("q1"),
 			assistantEntry("a1"),
@@ -1036,7 +1104,7 @@ describe("buildTranscript", () => {
 			userEntry("q2"),
 		];
 		expect(buildTranscript(branch, { maxRecentTurns: 2 })).toBe(
-			"Assistant: a1\nUser: q2",
+			"User: q1\nAssistant: a1\nUser: q2",
 		);
 	});
 	test("T32f: invalid maxRecentTurns in config fails closed (F-11)", () => {
@@ -1104,8 +1172,8 @@ describe("sanitizeSuggestion", () => {
 		expect(sanitizeSuggestion("```\nhi\n```", {})).toBe("hi");
 		expect(sanitizeSuggestion("```ts\nhi\n```", {})).toBe("hi");
 	});
-	test("T39: collapses internal newlines to single spaces", () => {
-		expect(sanitizeSuggestion("line1\nline2", {})).toBe("line1 line2");
+	test("T39: multi-line output takes the last valid line (extraction contract)", () => {
+		expect(sanitizeSuggestion("line1\nline2", {})).toBe("line2");
 	});
 	test("T40: caps to maxSuggestionChars at grapheme boundary", () => {
 		expect(sanitizeSuggestion("abcdefgh", { maxSuggestionChars: 3 })).toBe(
@@ -1472,6 +1540,7 @@ describe("real pi-tui editor integration", () => {
 			renderGhost: undefined,
 			fallbackToWidget: undefined,
 			abortInflight: () => {},
+			isComputing: () => false,
 			...over,
 		};
 	}
@@ -1640,7 +1709,6 @@ describe("real pi-tui editor integration", () => {
 	});
 
 	test("E6: terminal listeners run before focused editor input; consume stops the chain (F-13)", async () => {
-		vi.useFakeTimers();
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -1661,9 +1729,8 @@ describe("real pi-tui editor integration", () => {
 		expect(spyCalls).toBe(0);
 		expect(fake.editor.getText()).toBe("");
 		expect(fake.editorText).toBe("accept me");
-		// Non-accept key: our handler does NOT consume → editor gets it.
+		// Non-accept key: our handler dismisses but does NOT consume → editor gets it.
 		fake.deliverInput("x");
-		vi.advanceTimersByTime(50);
 		expect(spyCalls).toBe(1);
 		expect(fake.editor.getText()).toBe("x");
 	});
@@ -1734,12 +1801,15 @@ describe("real pi-tui editor integration", () => {
 // Identity-stable "previous editor owner" so restore calls (which pass the
 // captured prior factory back) are distinguishable from fresh installs.
 const PRIOR_EDITOR_FACTORY = (() => {}) as never;
+// Identity-stable "foreign owner" (pi-powerline-footer-shaped) for takeover tests.
+const FOREIGN_EDITOR_FACTORY = (() => {}) as never;
 function makeFake(opts: {
 	branch?: BranchEntry[];
 	idle?: boolean;
 	completeResult?: {
 		content: Array<{ type: "text"; text: string }>;
 		stopReason: string;
+		usage?: { output?: number; reasoning?: number };
 	};
 	completeError?: Error;
 	model?: { provider: string; id: string; baseUrl?: string };
@@ -1747,6 +1817,8 @@ function makeFake(opts: {
 	mode?: string;
 	projectTrusted?: boolean;
 	hasPriorEditor?: boolean;
+	/** Distinctive prior-owner factory for composition tests (defaults to the legacy no-op). */
+	priorEditorFactory?: (tui: unknown, theme: unknown, kb: unknown) => unknown;
 	/** setEditorComponent throws on install (e.g. the owner rejects replacement). */
 	setEditorComponentThrows?: boolean;
 	/** The constructed GhostEditor's tui.requestRender throws (ghost render pipeline fails). */
@@ -1756,12 +1828,16 @@ function makeFake(opts: {
 		| Promise<boolean>
 		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
-	/** Result for ctx.ui.select (consent chooser). Defaults to the first label. */
+	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
 	selectResult?: string | Promise<string> | (() => string | Promise<string>);
 	/** Hook invoked while the consent selector is open. */
 	selectCall?: () => void;
 	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
 	selectUnavailable?: boolean;
+	/** ctx.sessionManager.getSessionId() value (Pi exposes it). */
+	sessionId?: string;
+	/** complete() returns a pending promise; tests resolve it via resolveComplete. */
+	deferredComplete?: boolean;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -1786,6 +1862,9 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
+			maxTokens?: number;
+			headers?: Record<string, string>;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -1797,8 +1876,15 @@ function makeFake(opts: {
 	editorComponentCalls: number;
 	/** Count of restore calls: setEditorComponent(undefined) — the fallback path. */
 	editorComponentRestores: number;
+	/** Times the constructed GhostEditor requested a repaint. */
+	requestRenderCalls: number;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
+	/** Resolve a deferred complete() promise (deferredComplete mode). */
+	resolveComplete: (result?: {
+		content: Array<{ type: "text"; text: string }>;
+		stopReason: string;
+	}) => void;
 } {
 	let idle = opts.idle ?? true;
 	const calls = {
@@ -1808,6 +1894,9 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
+			maxTokens?: number;
+			headers?: Record<string, string>;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -1825,7 +1914,16 @@ function makeFake(opts: {
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
+	// pi-faithful ownership tracking: getEditorComponent returns whatever
+	// factory was last handed to setEditorComponent.
+	const priorFactoryRef: unknown =
+		opts.priorEditorFactory ?? PRIOR_EDITOR_FACTORY;
+	let currentEditorFactory: unknown = opts.hasPriorEditor
+		? priorFactoryRef
+		: undefined;
+	let requestRenderCalls = 0;
 	let lastEditorComponent: unknown;
+	let completeResolver: ((v: unknown) => void) | undefined;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
 	editor.focused = true;
@@ -1841,7 +1939,13 @@ function makeFake(opts: {
 			complete: async (
 				model: unknown,
 				context: { systemPrompt?: string; messages: unknown[] },
-				options?: { signal?: AbortSignal; reasoning?: string },
+				options?: {
+					signal?: AbortSignal;
+					reasoning?: string;
+					reasoningEffort?: string;
+					maxTokens?: number;
+					headers?: Record<string, string>;
+				},
 			) => {
 				calls.complete.push({
 					model,
@@ -1849,8 +1953,16 @@ function makeFake(opts: {
 					messages: context.messages,
 					signal: options?.signal,
 					reasoning: options?.reasoning,
+					reasoningEffort: options?.reasoningEffort,
+					maxTokens: options?.maxTokens,
+					headers: options?.headers,
 				});
 				if (opts.completeError) throw opts.completeError;
+				if (opts.deferredComplete) {
+					return new Promise((resolve) => {
+						completeResolver = resolve;
+					});
+				}
 				return (
 					opts.completeResult ?? {
 						content: [{ type: "text" as const, text: "suggestion" }],
@@ -1871,7 +1983,7 @@ function makeFake(opts: {
 							const result =
 								typeof opts.selectResult === "function"
 									? opts.selectResult()
-									: (opts.selectResult ?? options[0]!);
+									: (opts.selectResult ?? "once");
 							return typeof result === "string" ? result : await result;
 						},
 					}),
@@ -1907,15 +2019,21 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
-			getEditorComponent: () =>
-				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
+			getEditorComponent: () => currentEditorFactory,
 			setEditorComponent: (
 				factory:
 					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
 					| undefined,
 			) => {
 				editorComponentCalls += 1;
-				if (factory === PRIOR_EDITOR_FACTORY) {
+				currentEditorFactory = factory;
+				if (factory === FOREIGN_EDITOR_FACTORY) {
+					// Simulated takeover (pi-powerline-footer): another extension
+					// installed AFTER us. pi discards our editor from the tree.
+					editorComponentInstalled = false;
+					return;
+				}
+				if (factory === priorFactoryRef) {
 					// Restore path (fallbackToWidget): the previous owner is back.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
@@ -1935,6 +2053,7 @@ function makeFake(opts: {
 				lastEditorComponent = factory(
 					{
 						requestRender: () => {
+							requestRenderCalls += 1;
 							if (opts.requestRenderThrows) {
 								throw new Error("ghost render pipeline failed");
 							}
@@ -1945,7 +2064,10 @@ function makeFake(opts: {
 				);
 			},
 		},
-		sessionManager: { getBranch: () => opts.branch ?? [] },
+		sessionManager: {
+			getBranch: () => opts.branch ?? [],
+			getSessionId: () => opts.sessionId,
+		},
 	};
 	const pi = {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
@@ -1981,7 +2103,6 @@ function makeFake(opts: {
 				if (result?.consume) return;
 			}
 			editor.handleInput(data);
-			editorText = editor.getText();
 		},
 		get unsubInputCalls() {
 			return unsubInputCalls;
@@ -1998,6 +2119,9 @@ function makeFake(opts: {
 		get editorComponentRestores() {
 			return editorComponentRestores;
 		},
+		get requestRenderCalls() {
+			return requestRenderCalls;
+		},
 		get lastEditorComponent() {
 			return lastEditorComponent;
 		},
@@ -2005,6 +2129,18 @@ function makeFake(opts: {
 		handlers,
 		setIdle: (v: boolean) => {
 			idle = v;
+		},
+		resolveComplete: (
+			result?: {
+				content: Array<{ type: "text"; text: string }>;
+				stopReason: string;
+			},
+		) => {
+			completeResolver?.({
+				content: [{ type: "text", text: "suggestion" }],
+				stopReason: "stop",
+				...result,
+			});
 		},
 	};
 }
@@ -2084,6 +2220,7 @@ function makeOmpFake(opts: {
 			apiKey?: unknown;
 			signal?: AbortSignal;
 			reasoning?: unknown;
+			maxTokens?: unknown;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -2098,6 +2235,8 @@ function makeOmpFake(opts: {
 	editorComponentCalls: number;
 	/** Count of setEditorComponent(undefined) calls (default-editor restore). */
 	editorComponentRestores: number;
+	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
+	lastEditorComponent: unknown;
 } {
 	let idle = opts.idle ?? true;
 	let loaderCalls = 0;
@@ -2112,6 +2251,7 @@ function makeOmpFake(opts: {
 			apiKey?: unknown;
 			signal?: AbortSignal;
 			reasoning?: unknown;
+			maxTokens?: unknown;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -2126,6 +2266,7 @@ function makeOmpFake(opts: {
 	> = [];
 	let unsubInputCalls = 0;
 	let widgetContent: string[] | undefined;
+	let lastEditorComponent: unknown;
 	const editor = makeStubEditor();
 	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
@@ -2147,6 +2288,7 @@ function makeOmpFake(opts: {
 						apiKey: options?.apiKey,
 						signal: options?.signal,
 						reasoning: options?.reasoning,
+						maxTokens: options?.maxTokens,
 					});
 					if (opts.completeSimpleError) throw opts.completeSimpleError;
 					return (
@@ -2237,13 +2379,14 @@ function makeOmpFake(opts: {
 					return;
 				}
 				editorComponentInstalled = true;
-				factory(
+				lastEditorComponent = factory(
 					{
 						requestRender: () => {
 							if (opts.requestRenderThrows) {
 								throw new Error("ghost render pipeline failed");
 							}
 						},
+						terminal: { rows: 24, cols: 80 },
 					} as unknown,
 					{ borderColor: (s: string) => s, selectList: {} } as unknown,
 					{ matches: () => false } as unknown,
@@ -2295,6 +2438,9 @@ function makeOmpFake(opts: {
 		get editor() {
 			return editor;
 		},
+		get lastEditorComponent() {
+			return lastEditorComponent;
+		},
 		calls,
 		handlers,
 		setIdle: (v: boolean) => {
@@ -2340,6 +2486,222 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete).toHaveLength(1);
 	});
 
+	test("T75: foreign editor takeover after install → ghost re-owned at settle, owner kept as prior (pi-powerline-footer regression)", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(true);
+		// Simulate pi-powerline-footer (live-observed 2026-09-09): it installs
+		// its editorFactory AFTER us on the same session start, and pi discards
+		// our GhostEditor from the render tree — the ghost can never paint.
+		(
+			fake.ctx as unknown as {
+				ui: { setEditorComponent: (f: unknown) => void };
+			}
+		).ui.setEditorComponent(FOREIGN_EDITOR_FACTORY);
+		expect(fake.editorComponentInstalled).toBe(false);
+		const restoresBefore = fake.editorComponentRestores;
+		const callsAfterForeign = fake.editorComponentCalls;
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Ghost ownership re-established on top of the foreign owner (the
+		// historical working-with-powerline behavior): installed again, the
+		// foreign owner is NOT evicted/restored, the warning fires, and the
+		// ghost repaints instead of any widget fallback.
+		expect(fake.editorComponentCalls).toBe(callsAfterForeign + 1);
+		expect(fake.lastEditorComponent === undefined).toBe(false);
+		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentRestores).toBe(restoresBefore);
+		expect(fake.requestRenderCalls).toBeGreaterThan(0);
+		expect(
+			fake.calls.notifies.some(([m]) =>
+				m.includes("another extension owns the editor"),
+			),
+		).toBe(true);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("C15: ghost decorates the prior editor — prior renders beneath, keys and text delegate (Step 5)", async () => {
+		class DistinctiveEditor {
+			focused = true;
+			text = "";
+			inputs: string[] = [];
+			insertions: string[] = [];
+			history: string[] = [];
+			borderColor = (s: string): string => s;
+			onSubmit?: (t: string) => void;
+			constructor(
+				_tui: unknown,
+				_theme: unknown,
+				_kb: unknown,
+			) {}
+			render(width: number): string[] {
+				// Distinctive content + a focused cursor line so overlayGhost
+				// has a real insertion point.
+				return [`PRIOR-HEADER-${width}`, `${CURSOR_MARKER}\x1b[7m \x1b[0m`];
+			}
+			handleInput(data: string): void {
+				this.inputs.push(data);
+			}
+			getText(): string {
+				return this.text;
+			}
+			getExpandedText(): string {
+				return this.text;
+			}
+			setText(t: string): void {
+				this.text = t;
+			}
+			insertTextAtCursor(t: string): void {
+				this.insertions.push(t);
+				this.text += t;
+			}
+			addToHistory(t: string): void {
+				this.history.push(t);
+			}
+		}
+		const priorInstances: DistinctiveEditor[] = [];
+		const priorFactory = (tui: unknown, theme: unknown, kb: unknown) => {
+			const ed = new DistinctiveEditor(tui, theme, kb);
+			priorInstances.push(ed);
+			return ed;
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: priorFactory,
+			completeResult: {
+				content: [{ type: "text", text: "decorated suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// The ghost is installed ON TOP of the prior editor: the prior
+		// instance is constructed (not discarded) and stays live.
+		expect(priorInstances.length).toBeGreaterThan(0);
+		const prior = priorInstances[0]!;
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+			handleInput: (data: string) => void;
+			setText: (t: string) => void;
+			onSubmit?: (t: string) => void;
+		};
+		// Text handed to the top editor must land in the prior editor, not a
+		// private buffer of the decorator.
+		ed.setText("draft text");
+		expect(prior.text).toBe("draft text");
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Render composes: prior lines beneath + ghost suggestion on top.
+		const painted = ed.render(100).join("\n");
+		expect(painted).toContain("PRIOR-HEADER-100");
+		expect(painted).toContain("decorated suggestion");
+		// Accept through the decorated editor fills exactly once.
+		ed.handleInput("\x1b/");
+		expect(fake.editorText).toBe("decorated suggestion");
+		// pi's callback wiring forwards to the prior editor.
+		const onSubmit = (): void => {};
+		ed.onSubmit = onSubmit;
+		expect(prior.onSubmit).toBe(onSubmit);
+		// Keys reach the prior editor — its distinctive behavior survives.
+		// (This keypress also dismisses the accepted suggestion: correct.)
+		ed.handleInput("z");
+		expect(prior.inputs).toContain("z");
+		// Step 1 (E-01/E-02/E-03): the full editor surface pi drives on
+		// `this.editor` must reach the prior, not the decorator's dead state.
+		const contract = ed as unknown as {
+			insertTextAtCursor: (t: string) => void;
+			addToHistory: (t: string) => void;
+			borderColor: (s: string) => string;
+		};
+		contract.insertTextAtCursor("/tmp/pi-clipboard-test.png");
+		expect(prior.insertions).toEqual(["/tmp/pi-clipboard-test.png"]);
+		expect(prior.getText()).toContain("/tmp/pi-clipboard-test.png");
+		contract.addToHistory("!ls");
+		expect(prior.history).toEqual(["!ls"]);
+		const bashBorder = (s: string): string => `bash:${s}`;
+		contract.borderColor = bashBorder;
+		expect(prior.borderColor).toBe(bashBorder);
+		expect(contract.borderColor).toBe(bashBorder);
+	});
+
+	test("C16: prior editor construction fails → ghost falls back, prior owner restored (Step 5)", async () => {
+		const priorFactory = () => {
+			throw new Error("prior editor exploded");
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: priorFactory,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// Constructing the decorated prior failed: fall back to widget mode,
+		// restore the prior owner, and never leave the editor half-replaced.
+		expect(fake.editorComponentInstalled).toBe(false);
+		expect(fake.editorComponentRestores).toBe(1);
+		expect(
+			fake.calls.notifies.some(([m]) => m.includes("ghost rendering failed")),
+		).toBe(true);
+	});
+
+	test("C17: unfocused decorator over a prompt-glyph editor still paints the ghost", async () => {
+		class GlyphEditor {
+			focused = false;
+			text = "";
+			render(width: number): string[] {
+				// pi-powerline-footer's BashModeEditor shape: a decorative prompt
+				// glyph on the content line and NO cursor marker when unfocused.
+				return [`> ${" ".repeat(Math.max(0, width - 2))}`];
+			}
+			handleInput(): void {}
+			getText(): string {
+				return this.text;
+			}
+			getExpandedText(): string {
+				return this.text;
+			}
+			setText(t: string): void {
+				this.text = t;
+			}
+		}
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: () => new GlyphEditor(),
+			completeResult: {
+				content: [{ type: "text", text: "painted anyway" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+		};
+		// The harness never focuses the editor (unfocused tree, like a tab
+		// switch): the overlay must still paint because the prior editor IS
+		// empty — its prompt glyph is decoration, not content.
+		const painted = ed.render(80).join("\n");
+		expect(painted).toContain("painted anyway");
+	});
+
 	test("T73: default model = ctx.model when config has no model block", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -2375,7 +2737,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.model).toBe(configured);
 	});
 
-	test("T74b: config thinking level is passed as reasoning to complete", async () => {
+	test("T74b: config thinking passed as reasoningEffort (full-stream wire key)", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
@@ -2387,10 +2749,10 @@ describe("controller wiring (agent_settled)", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete[0]!.reasoning).toBe("low");
+		expect(fake.calls.complete[0]!.reasoningEffort).toBe("low");
 	});
 
-	test("T74c: no thinking config → reasoning undefined (model default)", async () => {
+	test("T74c: no thinking config → reasoningEffort undefined (model default)", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
@@ -2398,7 +2760,103 @@ describe("controller wiring (agent_settled)", () => {
 		// No config file → no thinking.
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
+		expect(fake.calls.complete[0]!.reasoningEffort).toBeUndefined();
+	});
+
+	test("T74g: opencode-go carries the session header (400 MissingSessionID otherwise)", async () => {
+		const configured = {
+			provider: "opencode-go",
+			id: "deepseek-v4.1-flash",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "sid-1",
+			findModel: (p, m) =>
+				p === "opencode-go" && m === "deepseek-v4.1-flash"
+					? configured
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "opencode-go", model: "deepseek-v4.1-flash" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toEqual({
+			"x-opencode-session": "sid-1",
+			"x-opencode-client": "pi",
+		});
+	});
+
+	test("T74i: model.sessionId in config wins over the host session id", async () => {
+		const configured = {
+			provider: "opencode-go",
+			id: "deepseek-v4.1-flash",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "host-sid",
+			findModel: (p, m) =>
+				p === "opencode-go" && m === "deepseek-v4.1-flash"
+					? configured
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: {
+					provider: "opencode-go",
+					model: "deepseek-v4.1-flash",
+					sessionId: "cfg-sid",
+				},
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toEqual({
+			"x-opencode-session": "cfg-sid",
+			"x-opencode-client": "pi",
+		});
+	});
+
+	test("T74h: non-opencode models get no injected headers", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			sessionId: "sid-1",
+		});
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete[0]!.headers).toBeUndefined();
+	});
+
+	test("T74j: no debug log unless config debug:true", async () => {
+		const off = await setup({ branch: [assistantEntry("a")] });
+		await off.fake.handlers.get("agent_settled")!({}, off.fake.ctx);
+		expect(off.fake.calls.complete).toHaveLength(1);
+		expect(existsSync(join(tmpHome, "next-prompt-debug.log"))).toBe(false);
+
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ debug: true }),
+		);
+		const on = await setup({ branch: [assistantEntry("a")] });
+		await on.fake.handlers.get("session_start")!({}, on.fake.ctx);
+		await on.fake.handlers.get("agent_settled")!({}, on.fake.ctx);
+		const log = readFileSync(join(tmpHome, "next-prompt-debug.log"), "utf-8");
+		expect(log).toContain('"event":"compute_go"');
+		expect(log).not.toContain("systemPrompt");
 	});
 
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
@@ -2424,6 +2882,32 @@ describe("controller wiring (agent_settled)", () => {
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ to accept");
+	});
+
+	test("T74f: configured-model fallback warns ONCE per session with the effective model (Step 6)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: () => undefined, // configured model never resolves
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ model: { provider: "anthropic", model: "haiku" } }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const warnings = fake.calls.notifies.filter(
+			([m, t]) =>
+				t === "warning" &&
+				m.includes("anthropic/haiku") &&
+				m.includes("not found"),
+		);
+		// Exactly one fallback warning per session, naming the effective model.
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]![0]).toContain("using current model");
+		expect(warnings[0]![0]).toContain("openai/gpt");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {
@@ -2478,7 +2962,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T79: complete returns stopReason length → no ghost", async () => {
+	test("T79: complete returns stopReason length → throttled warning, no ghost", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -2488,6 +2972,54 @@ describe("controller wiring (agent_settled)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				(n) => n[1] === "warning" && n[0].includes("truncated"),
+			),
+		).toBe(true);
+		// Throttled: a second settle does not repeat the diagnostic.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("truncated")),
+		).toHaveLength(1);
+	});
+
+	test("T79b: length stop with reasoning tokens → warning reports thinking usage, drops stale advice (P2a)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "" }],
+				stopReason: "length",
+				usage: { output: 0, reasoning: 2417 },
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const w = fake.calls.notifies.find(
+			([m, t]) => t === "warning" && m.includes("truncated"),
+		);
+		expect(w).toBeDefined();
+		expect(w![0]).toContain("thinking");
+		expect(w![0]).toContain("2417");
+		expect(w![0]).not.toContain("lower thinking level");
+	});
+
+	test("T79c: length stop with zero reasoning → warning reports narration overrun (P2a)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "" }],
+				stopReason: "length",
+				usage: { output: 2125, reasoning: 0 },
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const w = fake.calls.notifies.find(
+			([m, t]) => t === "warning" && m.includes("truncated"),
+		);
+		expect(w).toBeDefined();
+		expect(w![0]).toContain("narration");
+		expect(w![0]).toContain("2125");
+		expect(w![0]).not.toContain("lower thinking level");
 	});
 
 	test("T80: complete returns stopReason error → notify warning, no ghost", async () => {
@@ -2644,7 +3176,27 @@ describe("acceptance / regression", () => {
 		expect(shouldTrigger([assistantEntry("a")], true, "typing")).toBe("skip");
 	});
 
-	test("T91: non-text terminal input keeps an empty-editor suggestion visible", async () => {
+	test("T91: re-arm is transition-based — only delete-to-empty re-arms (controller-level)", async () => {
+		// The delete-to-empty re-arm is exercised end-to-end in the re-arm describe
+		// (T98+). This regression asserts that dismissing a showing suggestion by
+		// typing does NOT re-arm, because dismissal is not a non-empty→empty
+		// transition. Escape over an empty editor keeps the suggestion (T91b).
+		vi.useFakeTimers();
+		writeRearmConfig(60);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("q"); // typing dismisses
+		vi.advanceTimersByTime(150);
+		expect(fake.widgetContent).toBeUndefined(); // no re-arm
+	});
+
+	test("T91b: non-text terminal input keeps an empty-editor suggestion visible", async () => {
 		vi.useFakeTimers();
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -2773,13 +3325,95 @@ describe("accept handler (onTerminalInput)", () => {
 		expect(fake.editorText).toBe("already typed");
 	});
 
-	test("T97: accept key with no suggestion → not consumed", async () => {
+	test("T97: accept key with no suggestion → manually triggers a new computation", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// No suggestion computed (default completeResult text "suggestion" — but clear it first)
+		expect(fake.calls.complete).toHaveLength(1);
+		// Clear the suggestion (emulates a dismissed/cleared state). The accept
+		// key now doubles as the manual trigger and starts a fresh computation.
 		fake.handlers.get("input")!({}, fake.ctx);
 		const result = fake.inputHandler!("\x1b/");
-		expect(result).toBeUndefined();
+		expect(result).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(2);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Manual trigger (autoTrigger off): the accept key doubles as the trigger —
+// first press generates, second press accepts, an in-flight press is a no-op.
+// ---------------------------------------------------------------------------
+
+describe("manual trigger (autoTrigger off)", () => {
+	test("M1: agent_settled with autoTrigger=false does not auto-compute", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("M2: accept key with autoTrigger=false manually computes a suggestion", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("M3: accept key while computing is ignored (no concurrent request)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			deferredComplete: true,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// First press starts a deferred computation.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+		// Second press while in flight: swallowed, no new request.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.calls.complete).toHaveLength(1);
+		// Resolve; the suggestion then renders.
+		fake.resolveComplete();
+		await new Promise((r) => setTimeout(r, 0));
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion");
+	});
+
+	test("M4: manual trigger then accept — second press fills the editor", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "next thing" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ autoTrigger: false }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		// First press: generate.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(fake.widgetContent?.[0] ?? "").toContain("next thing");
+		// Second press: accept into the editor.
+		expect(fake.inputHandler!("\x1b/")).toEqual({ consume: true });
+		expect(fake.editorText).toBe("next thing");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 });
 
@@ -3261,40 +3895,29 @@ describe("cross-destination consent", () => {
 		}
 	}
 
-	test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
+	test("C1: allow-this-once is request-scoped → completes, discloses, persists NOTHING (F-12)", async () => {
 		const { fake } = await setupCross();
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.selects).toHaveLength(1);
-		// The dialog offers the three choices, always-allow second.
-		expect(fake.calls.selects[0]![1].join("|")).toContain(
-			"Always allow for this provider pair",
-		);
+		// Disclosure (F-11): destination + redacted transcript size in the title.
+		expect(fake.calls.selects[0]![0]).toContain("anthropic");
+		expect(/\d+ chars/.test(fake.calls.selects[0]![0])).toBe(true);
+		// The dialog offers every duration, durable ones labeled accurately.
+		const options = fake.calls.selects[0]![1].join("|");
+		expect(options).toContain("Allow this once");
+		expect(options).toContain("Allow for this session");
+		expect(options).toContain("Always allow (this project)");
+		expect(options).toContain("Always allow for this provider pair");
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "anthropic",
 			id: "haiku",
 		});
-		expect(consentsOnDisk()).toHaveLength(1);
-	});
-
-	test("C1b: consent selector input does not invalidate its own request", async () => {
-		let resolveSelect!: (value: string) => void;
-		const pending = new Promise<string>((resolve) => {
-			resolveSelect = resolve;
-		});
-		const { fake } = await setupCross({ selectResult: pending });
-		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-
-		expect(fake.calls.selects).toHaveLength(1);
-		fake.inputHandler!("\r");
-		resolveSelect("Allow once (this project)");
-		await settle;
-
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(consentsOnDisk()).toHaveLength(1);
+		// Request duration: nothing persisted to the consent file.
+		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
-		const { fake } = await setupCross({ selectResult: "Decline" });
+		const { fake } = await setupCross({ selectResult: "decline" });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
@@ -3306,8 +3929,10 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
-	test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
-		const { fake } = await setupCross();
+	test("C3: project-duration grant persists → second settle does not re-prompt (F-02)", async () => {
+		const { fake } = await setupCross({
+			selectResult: "Always allow (this project)",
+		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
 		expect(consentsOnDisk()).toHaveLength(1);
@@ -3420,9 +4045,7 @@ describe("cross-destination consent", () => {
 	});
 
 	test("C7: always-allow persists the directional pair to global config; no re-prompt afterwards", async () => {
-		const { fake } = await setupCross({
-			selectResult: "Always allow for this provider pair",
-		});
+		const { fake } = await setupCross({ selectResult: "always" });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(1);
@@ -3509,7 +4132,7 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.selects).toHaveLength(1);
 	});
 
-	test("C9: no select API → falls back to confirm dialog; grant → complete", async () => {
+	test("C9: no select API → falls back to confirm dialog; session-scoped grant → complete, nothing persisted", async () => {
 		const { fake } = await setupCross({
 			selectUnavailable: true,
 			confirmResult: true,
@@ -3518,7 +4141,8 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.selects).toHaveLength(0);
 		expect(fake.calls.confirms).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(1);
-		expect(consentsOnDisk()).toHaveLength(1);
+		// The confirm fallback grants the SESSION duration only (F-12).
+		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("C10: malformed allowCrossProviderPairs fails closed (no compute)", async () => {
@@ -3548,16 +4172,89 @@ describe("cross-destination consent", () => {
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
-	test("F08a: consent resolved AFTER prompt submission → no grant, no complete (F-08)", async () => {
-		let resolveSelect!: (value: string) => void;
-		const pending = new Promise<string>((resolve) => {
-			resolveSelect = resolve;
+	test("C11: session-duration grant → no re-prompt this session, nothing persisted, re-prompts next session", async () => {
+		const { fake } = await setupCross({ selectResult: "session" });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(1);
+		// Same session: granted for the session, no second dialog.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
+		expect(consentsOnDisk()).toHaveLength(0);
+		// New session: the session grant is gone → re-prompt.
+		const { fake: fake2 } = await setupCross({ selectResult: "session" });
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.selects).toHaveLength(1);
+	});
+
+	test("C12: OMP (no host trust API) ignores project routing and cross-provider keys (F-13)", async () => {
+		const projectPath = "/tmp/.pi/next-prompt.json";
+		mkdirSync("/tmp/.pi", { recursive: true });
+		writeFileSync(
+			projectPath,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		try {
+			const { fake } = await setupOmp({
+				branch: [assistantEntry("a")],
+				model: { provider: "openai", id: "gpt" },
+				findModel: (p, m) =>
+					p === "anthropic" && m === "haiku"
+						? { provider: "anthropic", id: "haiku" }
+						: undefined,
+			});
+			await fake.handlers.get("agent_end")!({}, fake.ctx);
+			// The project file must not route the transcript anywhere: the
+			// active model is used and no consent dialog was silently skipped.
+			expect(fake.calls.ompComplete[0]!.model).toEqual({
+				provider: "openai",
+				id: "gpt",
+			});
+			expect(fake.calls.selects).toHaveLength(0);
+		} finally {
+			rmSync(projectPath, { force: true });
+		}
+	});
+
+	test("C13: project allowCrossProviderPairs can never authorize a destination (floor)", async () => {
+		const projectPath = "/tmp/.pi/next-prompt.json";
+		mkdirSync("/tmp/.pi", { recursive: true });
+		writeFileSync(
+			projectPath,
+			JSON.stringify({
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		try {
+			const { fake } = await setupCross();
+			await fake.handlers.get("agent_settled")!({}, fake.ctx);
+			// Pairs are global-only: the project grant is ignored, so the
+			// consent dialog appears instead of a silent send.
+			expect(fake.calls.selects).toHaveLength(1);
+			expect(fake.calls.complete[0]!.model).toEqual({
+				provider: "anthropic",
+				id: "haiku",
+			});
+		} finally {
+			rmSync(projectPath, { force: true });
+		}
+	});
+
+	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
+			resolveConfirm = r;
 		});
 		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// A submitted prompt is a real interaction even while the selector is open.
-		fake.handlers.get("input")!({}, fake.ctx);
-		resolveSelect("Allow once (this project)"); // late approval
+		// Ordinary typing while the dialog is pending bumps the input generation.
+		fake.deliverInput("x");
+		resolveConfirm("once"); // late approval
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
@@ -3575,7 +4272,7 @@ describe("cross-destination consent", () => {
 			{ type: "session_start", reason: "reload" },
 			fake.ctx,
 		);
-		resolveConfirm("Allow once (this project)");
+		resolveConfirm("once");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
@@ -3589,7 +4286,7 @@ describe("cross-destination consent", () => {
 		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		resolveConfirm("Allow once (this project)");
+		resolveConfirm("once");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
@@ -3608,13 +4305,28 @@ describe("cross-destination consent", () => {
 		// Second settle while the first dialog is pending aborts the first.
 		const second = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// User approves the SECOND dialog only; the first never resolves.
-		resolvers[resolvers.length - 1]!("Allow once (this project)");
+		resolvers[resolvers.length - 1]!("once");
 		await second;
-		resolvers[0]!("Allow once (this project)"); // late approval on the aborted first dialog
+		resolvers[0]!("once"); // late approval on the aborted first dialog
 		await first;
 		// The stale first settle must never disclose; only the second may
 		// complete (its own fresh request).
 		expect(fake.calls.complete.length).toBeLessThanOrEqual(1);
+	});
+
+	test("F08e: consent resolved AFTER prompt submission → no grant, no complete (F-08)", async () => {
+		let resolveSelect!: (value: string) => void;
+		const pending = new Promise<string>((resolve) => {
+			resolveSelect = resolve;
+		});
+		const { fake } = await setupCross({ selectResult: pending });
+		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// A submitted prompt is a real interaction even while the selector is open.
+		fake.handlers.get("input")!({}, fake.ctx);
+		resolveSelect("Allow this once"); // late approval
+		await settle;
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
 	});
 });
 
@@ -3623,8 +4335,7 @@ describe("cross-destination consent", () => {
 // ---------------------------------------------------------------------------
 
 describe("widget dismissal", () => {
-	test("W1: default widget mode clears after the editor receives text", async () => {
-		vi.useFakeTimers();
+	test("W1: default widget mode clears the suggestion on a non-accept key", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -3634,10 +4345,8 @@ describe("widget dismissal", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
-		fake.deliverInput("a");
-		expect(fake.editorText).toBe("a");
-		vi.advanceTimersByTime(50);
-		expect(fake.widgetContent).toBeUndefined();
+		fake.inputHandler!("a"); // ordinary typing
+		expect(fake.widgetContent).toBeUndefined(); // dismissed immediately
 	});
 
 	test("W2: focus and navigation input do not clear an empty-editor suggestion", async () => {
@@ -3835,6 +4544,76 @@ describe("configureInteractively", () => {
 		});
 	});
 
+	test("T119b: opencode-go pick mints and stores a session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "opencode-go", id: "deepseek-v4.1-flash" }],
+			answers: {
+				model: "opencode-go/deepseek-v4.1-flash — deepseek-v4.1-flash",
+			},
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out?.model?.provider).toBe("opencode-go");
+		expect(out?.model?.model).toBe("deepseek-v4.1-flash");
+		expect(typeof out?.model?.sessionId).toBe("string");
+		expect((out?.model?.sessionId ?? "").length).toBeGreaterThan(10);
+	});
+
+	test("T119c: re-picking the same opencode-go model keeps its session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "opencode-go", id: "deepseek-v4.1-flash" }],
+			answers: {
+				model: "opencode-go/deepseek-v4.1-flash — deepseek-v4.1-flash",
+			},
+		});
+		const out = await configureInteractively(ctx, {
+			model: {
+				provider: "opencode-go",
+				model: "deepseek-v4.1-flash",
+				sessionId: "keep-me",
+			},
+		});
+		expect(out?.model).toEqual({
+			provider: "opencode-go",
+			model: "deepseek-v4.1-flash",
+			sessionId: "keep-me",
+		});
+	});
+
+	test("T119d: switching away from opencode-go drops the session id", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "anthropic", id: "haiku" }],
+			answers: { model: "anthropic/haiku — haiku" },
+		});
+		const out = await configureInteractively(ctx, {
+			model: {
+				provider: "opencode-go",
+				model: "deepseek-v4.1-flash",
+				sessionId: "old",
+			},
+		});
+		expect(out?.model).toEqual({ provider: "anthropic", model: "haiku" });
+	});
+
+	test("T119e: debug confirm true → saved; declined → key dropped", async () => {
+		const base = {
+			model: "(use current model)",
+			renderMode: "widget — colored line below the input box",
+			thinking: "(unset — model default)",
+			acceptKey: "alt+/",
+			rearmDelayMs: "2000",
+			maxTranscriptChars: "12000",
+			maxRecentTurns: "",
+			maxSuggestionChars: "320",
+			allowCrossProvider: false,
+		};
+		const onCtx = makeConfigCtx({ answers: { ...base, debug: true } });
+		expect((await configureInteractively(onCtx, {}))?.debug).toBe(true);
+
+		const offCtx = makeConfigCtx({ answers: { ...base, debug: false } });
+		const off = await configureInteractively(offCtx, { debug: true });
+		expect(off?.debug).toBeUndefined();
+	});
+
 	test("T120: cancel at model picker → undefined", async () => {
 		const ctx = makeConfigCtx({ answers: { model: undefined } });
 		const out = await configureInteractively(ctx, {});
@@ -3866,7 +4645,39 @@ describe("configureInteractively", () => {
 		});
 		const out = await configureInteractively(ctx, {});
 		expect(out?.thinking).toBeUndefined();
-		expect(out?.maxRecentTurns).toBeUndefined(); // empty input keeps all
+		expect("maxRecentTurns" in (out ?? {})).toBe(false); // no cap saved → no-op
+	});
+
+	test("T122b: empty maxRecentTurns input DELETES the saved cap (Step 6)", async () => {
+		const ctx = makeConfigCtx({
+			answers: {
+				model: "(use current model)",
+				renderMode: "widget — colored line below the input box",
+				thinking: "(unset — model default)",
+				acceptKey: "alt+/",
+				rearmDelayMs: "2000",
+				maxTranscriptChars: "12000",
+				maxRecentTurns: "",
+				maxSuggestionChars: "240",
+				allowCrossProvider: true,
+			},
+		});
+		const out = await configureInteractively(ctx, { maxRecentTurns: 4 });
+		// Explicit-undefined marker: saveConfig() drops the key, so the file
+		// returns to "all turns" — an empty input must clear the saved cap
+		// (the Step-0 footgun), not silently keep it.
+		expect(out).not.toBeUndefined();
+		expect("maxRecentTurns" in (out as object)).toBe(true);
+		expect(out?.maxRecentTurns).toBeUndefined();
+		const saved = saveConfig(out!);
+		expect(saved.saved).toBe(true);
+		const onDisk = JSON.parse(
+			readFileSync(
+				`${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`,
+				"utf-8",
+			),
+		) as Record<string, unknown>;
+		expect("maxRecentTurns" in onDisk).toBe(false);
 	});
 
 	test("T123: invalid numeric input → field not set", async () => {
@@ -4198,7 +5009,7 @@ describe("OMP lifecycle (agent_end)", () => {
 });
 
 describe("OMP completion transport (completeSimple)", () => {
-	test("C1: Pi completion uses modelRegistry.complete and never invokes the OMP loader", async () => {
+	test("TA1: Pi completion uses modelRegistry.complete and never invokes the OMP loader", async () => {
 		let loaderCalls = 0;
 		setOmpCompletionModuleForTests(() => {
 			loaderCalls += 1;
@@ -4221,7 +5032,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(fake.loaderCalls).toBe(1);
 	});
 
-	test("C3: OMP options — resolved model, exact context, registry resolver as apiKey, signal, reasoning", async () => {
+	test("TA3: OMP options — resolved model, exact context, registry resolver as apiKey, signal, reasoning", async () => {
 		const configured = { provider: "anthropic", id: "haiku" };
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
@@ -4269,7 +5080,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("what's next?");
 	});
 
-	test("C6: OMP length stop → no render, no notify", async () => {
+	test("C6: OMP length stop → no render, throttled warning", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleResult: {
@@ -4279,6 +5090,11 @@ describe("OMP completion transport (completeSimple)", () => {
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("truncated"),
+			),
+		).toBe(true);
 	});
 
 	test("C6b: OMP error stop → warning notify, no render", async () => {
@@ -4320,7 +5136,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		expect(failed).toHaveLength(1);
 	});
 
-	test("C8: abort while OMP transport pending → no error notify, no stale render", async () => {
+	test("OA8: abort while OMP transport pending → no error notify, no stale render", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleError: new Error("boom"),
@@ -4335,7 +5151,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		).toBe(false);
 	});
 
-	test("C9: completeSimple absent → controlled diagnostic, no crash, no suggestion", async () => {
+	test("OA9: completeSimple absent → controlled diagnostic, no crash, no suggestion", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleUnavailable: true,
@@ -4516,6 +5332,34 @@ describe("OMP render downgrade (widget-only)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
 		expect(fake.calls.ompComplete).toHaveLength(1); // no new model call
 	});
+
+	test("R8: OMP ghost render → immediate accept via editor dispatch fills exactly once (bypassed global listener)", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "run the checks" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+			handleInput: (data: string) => void;
+		};
+		// The ghost paints the suggestion immediately after the settle.
+		expect(ed.render(80).join("\n")).toContain("run the checks");
+		// OMP can dispatch custom-editor input WITHOUT the global terminal
+		// listener: the editor itself must apply the accept policy — exactly
+		// once, immediately after the render.
+		ed.handleInput("\x1b/");
+		expect(fake.editorText).toBe("run the checks");
+	});
 });
 
 describe("OMP acceptance / privacy", () => {
@@ -4578,7 +5422,7 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.calls.ompComplete).toHaveLength(0);
 	});
 
-	test("O3b: OMP cross-destination allow-once → completeSimple on the configured model, consent persisted", async () => {
+	test("O3b: OMP cross-destination request-scoped allow → completeSimple on the configured model, nothing persisted", async () => {
 		const configured = { provider: "anthropic", id: "haiku" };
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
@@ -4599,14 +5443,12 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
-		const consents = JSON.parse(
-			readFileSync(
+		// Request duration: nothing persisted (F-12/Step 4).
+		expect(
+			existsSync(
 				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
-				"utf-8",
 			),
-		) as Array<{ project: string }>;
-		expect(consents).toHaveLength(1);
-		expect(consents[0]!.project).toBe("/tmp");
+		).toBe(false);
 	});
 
 	test("O4: OMP consent resolved AFTER input → zero completeSimple calls, consent not persisted", async () => {
@@ -4710,4 +5552,446 @@ describe("OMP acceptance / privacy", () => {
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Step 1 quality regressions (Q-series)
+// ---------------------------------------------------------------------------
+// Contract tests for the suggestion-quality fix plan (ADVERSARIAL_FIX_PLAN.md).
+// These intentionally FAIL against the current implementation; each one pins
+// the observable behavior Steps 2–3 must deliver:
+//   Q1–Q2  maxRecentTurns counts user-led exchanges, not raw message entries
+//   Q3     an empty normalized transcript must never reach the model
+//   Q4     truncation respects whole-message boundaries and role labels
+//   Q5     compaction summaries are included, obsolete pre-compaction text is not
+//   Q6     OMP compute uses the terminal agent_end.messages snapshot
+//   Q7     bounded, redacted tool-outcome metadata is preserved
+//   Q8     malformed model output (sentinel variants, preambles, lists) never renders
+
+function toolUseAssistantEntry(): BranchEntry {
+	return {
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "internal reasoning" },
+				{ type: "toolCall", id: "t1", name: "read", arguments: {} },
+			],
+			stopReason: "toolUse",
+		},
+	};
+}
+
+function textlessStopAssistantEntry(): BranchEntry {
+	return {
+		type: "message",
+		message: {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "internal reasoning" }],
+			stopReason: "stop",
+		},
+	};
+}
+
+describe("Step 1 quality regressions (Q-series)", () => {
+	test("Q1: maxRecentTurns keeps the latest user-led exchange, not raw message entries", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolResultEntry(),
+			userEntry("q2"),
+			toolUseAssistantEntry(),
+			assistantEntry("Fixed it."),
+		];
+		const out = buildTranscript(branch, { maxRecentTurns: 1 });
+		expect(out).toBe("User: q2\nAssistant: Fixed it.");
+	});
+
+	test("Q2: textless tool-use assistant messages never consume the turn cap", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolUseAssistantEntry(),
+			toolUseAssistantEntry(),
+			toolUseAssistantEntry(),
+			userEntry("q2"),
+			assistantEntry("Fixed it."),
+		];
+		const out = buildTranscript(branch, { maxRecentTurns: 2 });
+		expect(out).toBe(
+			"User: q1\nAssistant: a1\nUser: q2\nAssistant: Fixed it.",
+		);
+	});
+
+	test("Q3: empty normalized transcript triggers zero model calls (Pi)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxRecentTurns: 1 }),
+		);
+		// Exchange semantics keep user-led windows, so the empty case is a
+		// branch whose only renderable tail is a textless assistant message.
+		const { fake } = await setup({ branch: [textlessStopAssistantEntry()] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("Q4a: truncation drops whole older messages instead of slicing mid-message", () => {
+		const branch = [userEntry("x".repeat(300)), userEntry("latest question")];
+		const out = buildTranscript(branch, { maxTranscriptChars: 50 });
+		expect(out).toBe("User: latest question");
+	});
+
+	test("Q4b: oversized newest message keeps its role label and marks truncation", () => {
+		const out = buildTranscript([userEntry("H".repeat(300))], {
+			maxTranscriptChars: 50,
+		});
+		expect(out.startsWith("User: ")).toBe(true);
+		expect(out).toContain("…");
+	});
+
+	test("Q5: compaction summary is included and obsolete pre-compaction text excluded", () => {
+		// Raw compaction entry shape (session format); BranchEntry widening lands in Step 2.
+		const compaction = {
+			type: "compaction",
+			summary: "Compacted: the user pivoted to the payments refactor",
+		} as unknown as BranchEntry;
+		const branch = [
+			userEntry("old task"),
+			assistantEntry("old answer"),
+			compaction,
+			userEntry("new task"),
+			assistantEntry("new answer"),
+		];
+		const out = buildTranscript(branch, {});
+		expect(out).toContain("payments refactor");
+		expect(out).toContain("User: new task");
+		expect(out).toContain("Assistant: new answer");
+		expect(out).not.toContain("old task");
+		expect(out).not.toContain("old answer");
+	});
+
+	test("Q6: OMP compute builds context from the terminal agent_end.messages snapshot, not a stale branch", async () => {
+		const { fake } = await setupOmp({
+			branch: [userEntry("old request"), assistantEntry("stale reply")],
+		});
+		await fake.handlers.get("agent_end")!(
+			{
+				type: "agent_end",
+				willContinue: false,
+				messages: [
+					{ role: "user", content: "current request" },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "final reply" }],
+						stopReason: "stop",
+					},
+				],
+			},
+			fake.ctx,
+		);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const sent = (fake.calls.ompComplete[0]!.messages[0] as {
+			content: Array<{ type: string; text?: string }>;
+		}).content[0]!.text;
+		expect(sent).toContain("current request");
+		expect(sent).toContain("final reply");
+		expect(sent).not.toContain("old request");
+		expect(sent).not.toContain("stale reply");
+	});
+
+	test("Q7: bounded redacted tool-outcome metadata is preserved in the transcript", () => {
+		// Raw toolResult shape with tool metadata; BranchEntry widening lands in Step 2.
+		const toolResult = {
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolName: "bash",
+				isError: true,
+				content: [
+					{ type: "text", text: "FAIL-SECRET-MARKER huge failing output" },
+				],
+			},
+		} as unknown as BranchEntry;
+		const branch = [
+			userEntry("run the tests"),
+			toolResult,
+			assistantEntry("Tests are failing."),
+		];
+		const out = buildTranscript(branch, {});
+		expect(out).toContain("User: run the tests");
+		expect(out).toContain("Assistant: Tests are failing.");
+		expect(out.toLowerCase()).toContain("bash");
+		expect(out.toLowerCase()).toContain("error");
+		expect(out).not.toContain("FAIL-SECRET-MARKER");
+	});
+
+	test("Q8a: sentinel variants are rejected (NONE., none)", () => {
+		expect(sanitizeSuggestion("NONE.")).toBe("");
+		expect(sanitizeSuggestion("none")).toBe("");
+	});
+
+	test("Q8b: preamble yields the instruction; alternative lists are rejected", () => {
+		// Last valid line wins: the preamble line fails, the instruction passes.
+		expect(sanitizeSuggestion("Here is the suggestion:\nRun the tests")).toBe(
+			"Run the tests",
+		);
+		expect(sanitizeSuggestion("1. Run tests\n2. Commit changes")).toBe("");
+	});
+
+	test("Q8c: a single clean instruction is still accepted", () => {
+		expect(sanitizeSuggestion("Run the tests")).toBe("Run the tests");
+	});
+
+	test("Q8d: controller extracts the instruction from preamble chatter", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{ type: "text", text: "Here is the suggestion:\nRun the tests" },
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("Run the tests");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Step 3: prediction behavior (prompt hierarchy, validation, caps, corpus)
+// ---------------------------------------------------------------------------
+
+describe("Step 3 prediction behavior", () => {
+	test("S1: system prompt carries the decision hierarchy and NONE sentinel", () => {
+		expect(SYSTEM_PROMPT).toContain("priority order");
+		expect(SYSTEM_PROMPT).toContain("NONE");
+		expect(SYSTEM_PROMPT).toContain("never a continuation");
+	});
+
+	test("S2: Pi transport receives a thinking-aware maxTokens cap (F-09)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxSuggestionChars: 320 }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		// ceil(320/4)+8 = 88, + unset-thinking margin 3072 = 3160 (P2b-calibrated)
+		expect(fake.calls.complete[0]!.maxTokens).toBe(3160);
+	});
+
+	test("S3: OMP transport receives a thinking-aware maxTokens cap (F-09)", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const cap = fake.calls.ompComplete[0]!.maxTokens as number;
+		expect(cap).toBeGreaterThan(15);
+		expect(cap).toBeLessThanOrEqual(8192);
+	});
+
+	test("S4: suggestionMaxTokens adds thinking-aware reasoning headroom (P2b-calibrated)", () => {
+		// unset margin 3072: measured ~2400 thinking tokens when no effort is
+		// sent — the old 2048 margin truncated mid-thinking (2026-09-09).
+		expect(suggestionMaxTokens({})).toBe(68 + 3072);
+		// low margin 2432: reasoning measured 0 at low, but narration run-ons
+		// need tailroom for the instruction that follows them.
+		expect(suggestionMaxTokens({ maxSuggestionChars: 320, thinking: "low" })).toBe(
+			88 + 2432,
+		);
+		// minimal margin 256: measured to suppress thinking entirely.
+		expect(suggestionMaxTokens({ thinking: "minimal" })).toBe(68 + 256);
+		// medium margin 3072: measured ~2400 thinking tokens.
+		expect(suggestionMaxTokens({ thinking: "medium" })).toBe(68 + 3072);
+		// high margin 6144: measured 1132–2300 thinking tokens, headroom is
+		// free (max_tokens is an upper bound).
+		expect(suggestionMaxTokens({ thinking: "high" })).toBe(68 + 6144);
+		// base 2508 + xhigh margin 6144 → capped at 8192
+		expect(
+			suggestionMaxTokens({ maxSuggestionChars: 10000, thinking: "xhigh" }),
+		).toBe(8192);
+	});
+
+	test("S5: single-line label prefix is stripped, instruction kept", () => {
+		expect(sanitizeSuggestion("Suggestion: run the linter", {})).toBe(
+			"run the linter",
+		);
+	});
+
+	test("S6: rejected non-NONE chatter warns once per session", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{
+						type: "text",
+						text: "User asks about the timeline; likely next is a plan update — but per rules",
+					},
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("rejected")),
+		).toHaveLength(1);
+		// Throttled: a second settle does not repeat the diagnostic.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter((n) => n[0].includes("rejected")),
+		).toHaveLength(1);
+	});
+
+	test("S7: NONE output stays fully silent (normal outcome)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "NONE" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.calls.notifies).toHaveLength(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Suggestion quality corpus (deterministic, no network)
+// ---------------------------------------------------------------------------
+// Representative real-shaped transcripts and model outputs pinning the
+// quality contract; run in CI so regressions here block the build.
+
+describe("suggestion quality corpus (deterministic)", () => {
+	const toolResultMeta = (name: string, isError: boolean): BranchEntry => ({
+		type: "message",
+		message: {
+			role: "toolResult",
+			toolName: name,
+			isError,
+			content: [{ type: "text", text: "raw output that must never leak" }],
+		},
+	});
+	const compactionEntry = (summary: string): BranchEntry => ({
+		type: "compaction",
+		summary,
+	});
+
+	const transcriptCases: Array<{
+		name: string;
+		branch: BranchEntry[];
+		config?: NextPromptConfig;
+		includes: string[];
+		excludes?: string[];
+	}> = [
+		{
+			name: "tool-loop turn keeps user task, tool status, and final reply",
+			branch: [
+				userEntry("Fix the auth test"),
+				toolUseAssistantEntry(),
+				toolResultMeta("bash", true),
+				toolUseAssistantEntry(),
+				assistantEntry("Fixed."),
+			],
+			includes: [
+				"User: Fix the auth test",
+				"Tool bash: error",
+				"Assistant: Fixed.",
+			],
+			excludes: ["raw output that must never leak"],
+		},
+		{
+			name: "compacted session keeps summary and post-compaction exchange",
+			branch: [
+				userEntry("old task"),
+				assistantEntry("old answer"),
+				compactionEntry("Compacted: pivot to the payments refactor"),
+				userEntry("new task"),
+				assistantEntry("done"),
+			],
+			includes: [
+				"Summary: Compacted: pivot to the payments refactor",
+				"User: new task",
+				"Assistant: done",
+			],
+			excludes: ["old task", "old answer"],
+		},
+		{
+			name: "turn cap keeps only the latest user-led exchange",
+			branch: [
+				userEntry("q1"),
+				assistantEntry("a1"),
+				userEntry("q2"),
+				assistantEntry("a2"),
+			],
+			config: { maxRecentTurns: 1 },
+			includes: ["User: q2", "Assistant: a2"],
+			excludes: ["q1", "a1"],
+		},
+		{
+			name: "oversized final reply stays bounded with its role label",
+			branch: [
+				userEntry("explain the parser"),
+				assistantEntry("E".repeat(20000)),
+			],
+			config: { maxTranscriptChars: 2000 },
+			includes: ["Assistant: ", "…"],
+		},
+	];
+	for (const c of transcriptCases) {
+		test(`corpus transcript: ${c.name}`, () => {
+			const out = buildTranscript(c.branch, c.config ?? {});
+			for (const inc of c.includes) expect(out).toContain(inc);
+			for (const exc of c.excludes ?? []) expect(out).not.toContain(exc);
+		});
+	}
+
+	const outputCases: Array<[string, string]> = [
+		["Run the tests", "Run the tests"],
+		["NONE", ""],
+		["none.", ""],
+		["NONE!", ""],
+		["Here is the suggestion:\nRun the tests", "Run the tests"],
+		["1. Run tests\n2. Commit changes", ""],
+		["Suggestion: run the linter", "run the linter"],
+		["- fix the bug", ""],
+		["", ""],
+		["   ", ""],
+		// Live-observed GLM shapes (2026-09-09, flappy session):
+		[
+			'User asks about terrain pipes. Assistant will respond.\n\nSounds good — update the plan with terrain-aware pipes and start building.',
+			'Sounds good — update the plan with terrain-aware pipes and start building.',
+		],
+		[
+			'User asks about terrain affecting pipe heights. Agent will respond. Next user instruction likely approving something — but we predict',
+			'',
+		],
+		[
+			'User asks about more features; likely next is "go ahead". Most logical: unblock implementation.\n\nGo ahead and start building.',
+			'Go ahead and start building.',
+		],
+		// Live-observed GLM meta-voice (2026-09-09, flappy session): describes
+		// what the user should type instead of EMITTING the literal next
+		// prompt. The quoted directive inside is the instruction (Gabi:
+		// expected exactly "execute core gameplay").
+		[
+			'Next input I need from you: **"execute core gameplay"** — that unblocks Phase B (B1 bird entity, B2 physics/input, B3 terrain mesh, B4 terrain-aware pipes, B5 collision/death, B6 scoring/states, B7 pause). Everything else stays blocked until then.',
+			'execute core gameplay',
+		],
+		// Live-observed (2026-09-09, flappy session): readiness meta-voice that
+		// REPORTS status to the user ('Ready for ...') instead of emitting the
+		// literal next prompt. The quoted directive inside wins (Gabi: expected
+		// exactly "execute verification").
+		[
+			'Ready for the **"execute verification"** gate (Phase D) whenever you want to run it.',
+			'execute verification',
+		],
+	];
+	for (const [raw, expected] of outputCases) {
+		test(`corpus output: ${JSON.stringify(raw)} → ${JSON.stringify(expected)}`, () => {
+			expect(sanitizeSuggestion(raw, {})).toBe(expected);
+		});
+	}
 });
