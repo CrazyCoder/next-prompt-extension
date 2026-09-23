@@ -282,16 +282,17 @@ Mitigations:
 installs its editor later either wraps the ghost editor, which keeps it live, or
 discards it; on Pi only a discarded ghost is installed again, when the next
 suggestion is shown. If the ghost fails, the mode falls back to widget. A failed
-install restores the owner that was current just before it; on OMP, which has no
-editor-owner getter, that is the **default** editor. A ghost that fails later,
-while rendering, leaves the editor slot alone, so extensions installed after it
-stay in place: the ghost editor stops drawing the ghost and passes everything
-else through. An error from the other extension's own render is passed through
-unchanged. OMP also has no host-side extension-editor teardown, so next-prompt
-resets its editor to default at the next `session_start`. The host
-clears extension listeners when the UI is reset; each fresh `session_start`
-(reload/new/resume/fork) re-registers exactly one listener and re-installs the
-editor once.
+install restores the owner that was current just before it, or the default
+editor if that owner's own editor cannot be built; on OMP, which has no
+editor-owner getter, it is always the **default** editor. A ghost that fails
+later, while rendering, leaves the editor slot alone, so extensions installed
+after it stay in place: the ghost editor stops drawing the ghost and passes
+everything else through. An error from the other extension's own render is
+passed through unchanged. OMP also has no host-side extension-editor teardown,
+so next-prompt resets its editor to default at the next `session_start`. The
+host clears extension listeners when the UI is reset; each fresh
+`session_start` (reload/new/resume/fork) re-registers exactly one listener and
+re-installs the editor once.
 2. On completion:
    - **Pi:** `agent_settled` (its fully-settled contract) — if the editor is
      empty, the controller calls

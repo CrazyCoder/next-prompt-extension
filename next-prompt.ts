@@ -2713,7 +2713,13 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			try {
 				ctx.ui.setEditorComponent?.(prior as never);
 			} catch {
-				// Restoration is best-effort; widget mode still works.
+				// The owner's own factory threw too (Pi builds the restored
+				// editor at once); never leave the host without an editor.
+				try {
+					ctx.ui.setEditorComponent?.(undefined as never);
+				} catch {
+					// Restoration is best-effort; widget mode still works.
+				}
 			}
 			fallbackToWidget();
 		}

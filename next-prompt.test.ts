@@ -1680,9 +1680,9 @@ describe("real pi-tui editor integration", () => {
 		const second = ed.render(40);
 		expect(first).toEqual(base);
 		expect(second).toEqual(base);
-		// Exactly one fallback fired (the controller's guard makes later calls
-		// no-ops once renderMode is widget; the spy here re-enters per render).
-		expect(fallbacks).toBeGreaterThan(0);
+		// Exactly one fallback fired: once renderMode is widget, render returns
+		// the base lines without trying the overlay again.
+		expect(fallbacks).toBe(1);
 	});
 
 	test("E4d: GhostEditor in widget mode renders its base lines without the ghost", () => {
@@ -2050,9 +2050,16 @@ function makeFake(opts: {
 					return;
 				}
 				if (factory === priorFactoryRef) {
-					// Restore path (fallbackToWidget): the previous owner is back.
+					// Restore path (failed install): the previous owner is back.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
+					// Pi builds the restored owner's editor at once, and a
+					// distinctive prior factory may throw here too.
+					opts.priorEditorFactory?.(
+						{ requestRender: () => {} },
+						{ borderColor: (s: string) => s, selectList: {} },
+						{ matches: () => false },
+					);
 					return;
 				}
 				if (factory === undefined) {
@@ -2711,7 +2718,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(contract.borderColor).toBe(bashBorder);
 	});
 
-	test("C16: prior editor construction fails → ghost falls back, prior owner restored (Step 5)", async () => {
+	test("C16: prior editor construction fails → ghost falls back; restoring the broken owner fails too, so the default editor is restored (Step 5)", async () => {
 		const priorFactory = () => {
 			throw new Error("prior editor exploded");
 		};
@@ -2726,10 +2733,16 @@ describe("controller wiring (agent_settled)", () => {
 			JSON.stringify({ renderMode: "ghost" }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		// Constructing the decorated prior failed: fall back to widget mode,
-		// restore the prior owner, and never leave the editor half-replaced.
+		// Constructing the decorated prior failed, and so does rebuilding the
+		// prior itself: the host must end on the default editor, never on
+		// none.
 		expect(fake.editorComponentInstalled).toBe(false);
-		expect(fake.editorComponentRestores).toBe(1);
+		expect(fake.editorComponentRestores).toBe(2); // prior attempt, then default
+		expect(
+			(
+				fake.ctx as unknown as { ui: { getEditorComponent: () => unknown } }
+			).ui.getEditorComponent(),
+		).toBeUndefined();
 		expect(
 			fake.calls.notifies.some(([m]) => m.includes("ghost rendering failed")),
 		).toBe(true);
