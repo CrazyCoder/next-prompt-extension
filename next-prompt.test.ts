@@ -1685,6 +1685,19 @@ describe("real pi-tui editor integration", () => {
 		expect(fallbacks).toBeGreaterThan(0);
 	});
 
+	test("E4d: GhostEditor in widget mode renders its base lines without the ghost", () => {
+		const state = mkGhostState({ suggestion: "ghost text", renderMode: "widget" });
+		const ed = new GhostEditor(mkTui(), mkTheme(), {} as never, state);
+		ed.focused = true;
+		const baseEditor = new CustomEditor(mkTui(), mkTheme(), {} as never);
+		baseEditor.focused = true;
+		const base = baseEditor.render(40);
+		const lines = ed.render(40);
+		expect(lines.length).toBeGreaterThan(0);
+		expect(lines).toEqual(base);
+		expect(lines.join("\n")).not.toContain("ghost text");
+	});
+
 	test("E5: autocomplete dropdown renders width-safe and Tab applies the selection", async () => {
 		const ed = makeStubEditor();
 		ed.focused = true;
@@ -2768,6 +2781,78 @@ describe("controller wiring (agent_settled)", () => {
 		expect(painted).toContain("painted anyway");
 	});
 
+	test("C18: prior editor render throws → the error propagates unchanged, no ghost fallback", async () => {
+		const priorError = new Error("prior render exploded");
+		let explode = false;
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: () => ({
+				focused: false,
+				render: (width: number) => {
+					if (explode) throw priorError;
+					return [" ".repeat(width)];
+				},
+				handleInput: () => {},
+				getText: () => "",
+				setText: () => {},
+			}),
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+		};
+		explode = true;
+		let thrown: unknown;
+		try {
+			ed.render(40);
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown === priorError).toBe(true);
+		expect(fake.calls.notifies).toHaveLength(0);
+		expect(fake.editorComponentRestores).toBe(0);
+	});
+
+	test("C19: after a ghost failure the decorator renders the prior editor's lines unchanged", async () => {
+		const priorLines = ["> prior editor line"];
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			requestRenderThrows: true,
+			priorEditorFactory: () => ({
+				focused: false,
+				render: () => priorLines,
+				handleInput: () => {},
+				getText: () => "",
+				setText: () => {},
+			}),
+			completeResult: {
+				content: [{ type: "text", text: "widget only now" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("widget only now");
+		const ed = fake.lastEditorComponent as unknown as {
+			render: (w: number) => string[];
+		};
+		const lines = ed.render(40);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toBe(priorLines[0]);
+	});
+
 	test("T73: default model = ctx.model when config has no model block", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -3748,7 +3833,7 @@ describe("renderMode config", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
 	});
 
-	test("T106d: ghost render pipeline throws → falls back to widget, restores default editor (P1-1)", async () => {
+	test("T106d: ghost render pipeline throws → falls back to widget, editor slot left alone (P1-1)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -3763,9 +3848,13 @@ describe("renderMode config", () => {
 			},
 		});
 		expect(fake.editorComponentInstalled).toBe(true); // install itself succeeded
+		const callsAfterInstall = fake.editorComponentCalls;
 		// The failure surfaces when the suggestion renders (requestGhostRender).
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editorComponentRestores).toBe(1); // default editor restored
+		// No editor swap: the ghost editor stays as a plain editor.
+		expect(fake.editorComponentCalls).toBe(callsAfterInstall);
+		expect(fake.editorComponentRestores).toBe(0);
+		expect(fake.editorComponentInstalled).toBe(true);
 		expect(
 			fake.calls.notifies.some(
 				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
@@ -3780,6 +3869,44 @@ describe("renderMode config", () => {
 				m.includes("fell back to widget mode"),
 			),
 		).toHaveLength(1);
+	});
+
+	test("T106e: ghost render failure under wrapping owners → wrappers stay installed (no eviction)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			requestRenderThrows: true,
+			completeResult: {
+				content: [{ type: "text", text: "fallback suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		const ui = (
+			fake.ctx as unknown as {
+				ui: {
+					getEditorComponent: () => (...a: unknown[]) => unknown;
+					setEditorComponent: (f: unknown) => void;
+				};
+			}
+		).ui;
+		for (let i = 0; i < 2; i++) {
+			const previous = ui.getEditorComponent();
+			ui.setEditorComponent((...a: unknown[]) => previous(...a));
+		}
+		const outerWrapper = ui.getEditorComponent();
+		const callsAfterWrap = fake.editorComponentCalls;
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter(([m]) => m.includes("fell back to widget mode")),
+		).toHaveLength(1);
+		expect(fake.editorComponentCalls).toBe(callsAfterWrap);
+		expect(ui.getEditorComponent() === outerWrapper).toBe(true);
+		expect(fake.editorComponentRestores).toBe(0);
+		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
@@ -5398,7 +5525,7 @@ describe("OMP render downgrade (widget-only)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("both suggestion");
 	});
 
-	test("R4: OMP ghost render failure → one warning, default editor restored, no duplicate warning on later settles", async () => {
+	test("R4: OMP ghost render failure → one warning, editor slot left alone, no duplicate warning on later settles", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -5409,8 +5536,8 @@ describe("OMP render downgrade (widget-only)", () => {
 			requestRenderThrows: true,
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.editorComponentInstalled).toBe(false);
-		expect(fake.editorComponentRestores).toBe(1); // default editor restored
+		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentRestores).toBe(0);
 		expect(
 			fake.calls.notifies.filter(
 				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),

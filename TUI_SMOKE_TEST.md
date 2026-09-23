@@ -74,8 +74,8 @@ Run each sequence in `widget`, `ghost`, and `both`:
   (no double ghost/widgets, no doubled accept key).
 - [ ] Run alongside another custom-editor extension: next-prompt shows no
   warning, decorates it in ghost mode, and only falls back to widget mode if
-  ghost rendering actually fails (prior owner restored, suggestion still appears
-  below the box).
+  ghost rendering actually fails (the other extension's editor keeps working,
+  suggestion still appears below the box).
 
 ### Model / lifecycle error paths
 

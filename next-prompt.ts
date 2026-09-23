@@ -8,10 +8,11 @@
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
- * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
- * failure there restores the default editor (Pi restores the captured prior
- * owner), and another custom-editor extension installed first in the same OMP
- * session is not detected (last installer wins).
+ * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a
+ * failed ghost install there restores the default editor (Pi restores the
+ * captured prior owner), and another custom-editor extension installed first in
+ * the same OMP session is not detected (last installer wins). A ghost that
+ * fails later, while rendering, leaves the editor slot alone on both hosts.
  *
  * A suggestion is UI-only output of THIS extension: a separate model call
  * renders it in the input area, it is never part of the coding agent's reply,
@@ -1762,7 +1763,7 @@ export interface SuggestionState {
 	renderGhost: (() => void) | undefined;
 	/**
 	 * Permanently switch this session from ghost/both to widget mode after a
-	 * ghost rendering failure (the other editor owner gets restored). Guarded:
+	 * ghost failure; the editor slot is left as it is. Guarded:
 	 * the first call wins, later calls are no-ops. Undefined when ghost was
 	 * never attempted (widget-only sessions).
 	 */
@@ -2149,12 +2150,14 @@ class GhostEditor extends CustomEditor {
 		// `string[]`, OMP returns `readonly string[]`. The override must return
 		// a mutable array to satisfy both hosts' base signatures.
 		const base = super.render(width).slice();
+		// After a ghost failure this stays installed as a plain editor.
+		if (this.suggestionState.renderMode === "widget") return base;
 		try {
 			return overlayGhost(base, this.suggestionState.suggestion, width);
 		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
-			// mode (restoring the previous editor owner).
+			// mode.
 			this.suggestionState.fallbackToWidget?.();
 			return base;
 		}
@@ -2270,17 +2273,12 @@ class DecoratingGhostEditor extends CustomEditor {
 
 	render(width: number): string[] {
 		this.syncFocus();
-		let base: string[];
-		try {
-			// The prior editor renders beneath; the ghost overlays on top.
-			base = this.prior.render(width).slice();
-		} catch {
-			// The prior's own render failed — that is the other extension's
-			// failure, not ours: give up the editor slot (restore the prior
-			// factory) and surface the suggestion via the widget.
-			this.suggestionState.fallbackToWidget?.();
-			return [];
-		}
+		// The prior editor renders beneath; the ghost overlays on top. A throw
+		// from the prior's own render is the other extension's failure and
+		// propagates unchanged, exactly as it would without this decorator.
+		const base = this.prior.render(width).slice();
+		// After a ghost failure this stays installed as a pass-through.
+		if (this.suggestionState.renderMode === "widget") return base;
 		try {
 			// The prior editor may render decorative prompt glyphs even when
 			// empty (pi-powerline-footer's `>`): vouch emptiness via its own
@@ -2641,36 +2639,26 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		clearSuggestion(ref.state);
 	}
 
-	// Install the ghost editor, capturing any current owner as the ghost-
-	// failure restore target. Called at session start and re-issued when a
-	// settle-time ownership check finds the slot taken by another extension.
+	// Install the ghost editor on top of any current owner. Called at session
+	// start and re-issued when a settle-time ownership check finds the slot
+	// taken by another extension.
 	function installGhostEditor(ctx: HostCtx, state: SuggestionState): void {
-		// OMP has no getEditorComponent(): `prior` stays undefined there,
-		// so a fallback restores the DEFAULT editor (setEditorComponent
+		// OMP has no getEditorComponent(): `prior` stays undefined there, so
+		// a failed install restores the DEFAULT editor (setEditorComponent
 		// with no factory) rather than a captured prior owner.
 		const prior = ctx.ui.getEditorComponent?.();
 		// P1-1: permanent, guarded fallback. First call wins; once we are in
 		// widget mode there is nothing left to fall back to, so later calls
-		// (e.g. from a stale GhostEditor instance) are no-ops.
+		// (e.g. from a stale GhostEditor instance) are no-ops. The editor
+		// slot is left alone: our editors stop drawing the ghost in widget
+		// mode and pass everything else through, while restoring an owner
+		// captured earlier would evict every extension installed since.
 		const fallbackToWidget = () => {
 			if (state.renderMode === "widget") return;
 			state.renderMode = "widget";
 			state.renderGhost = undefined;
-			state.ghostBuiltUnder = undefined;
-			editorInstalled = false;
-			editorInstalledForHost = false;
-			// Restore the previous owner (or the default editor) so the other
-			// extension's surface is not left half-replaced. `prior` is an
-			// opaque factory captured at the boundary and handed back
-			// verbatim; on OMP it is undefined and the default editor is
-			// restored.
-			try {
-				ctx.ui.setEditorComponent?.(prior as never);
-			} catch {
-				// Restoration is best-effort; widget mode still works.
-			}
 			ctx.ui.notify(
-				"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
+				"next-prompt: ghost rendering failed; fell back to widget mode",
 				"warning",
 			);
 			renderSuggestion(state);
@@ -2718,9 +2706,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			// to tell the user; only a failed ghost (fallbackToWidget) notifies.
 			if (prior && prior !== factory) diag("editor_decorated");
 		} catch {
-			// Installation threw (e.g. the owner rejected replacement): keep
-			// widget mode, restore the prior owner, and let the suggestion
-			// surface via the widget.
+			// Installation threw (e.g. the owner rejected replacement), and the
+			// host may be left without an editor. `prior` was read just before
+			// this attempt, so it is still the current owner: hand it back
+			// verbatim (the default editor on OMP), then use the widget.
+			try {
+				ctx.ui.setEditorComponent?.(prior as never);
+			} catch {
+				// Restoration is best-effort; widget mode still works.
+			}
 			fallbackToWidget();
 		}
 	}
@@ -2777,9 +2771,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		// F-05: install the ghost editor exactly once per session. If another
 		// extension already owns the editor, still try ghost mode on top of it
-		// (P1-1): only when the ghost actually fails to render do we restore the
-		// prior owner and switch to widget mode. The prior factory is captured
-		// before installation so the fallback can restore it.
+		// (P1-1): only when the ghost actually fails do we switch to widget
+		// mode (see installGhostEditor for what each failure does to the slot).
 		const renderMode: RenderMode = effective.renderMode ?? "widget";
 
 		const state: SuggestionState = {
@@ -3166,8 +3159,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// GhostEditor is discarded and the ghost can never paint, with no
 		// error raised. If the current owner was not the one being installed
 		// when our factory last ran, our editor is not in the tree: install on
-		// top again, and the current owner becomes the restore target of a
-		// later ghost-failure fallback. An owner that wraps our editor
+		// top again, decorating the current owner. An owner that wraps our editor
 		// (pi-contextual-stash, pi-clear-hotkey) runs our factory inside its
 		// own, so the ghost is still live and nothing is re-installed.
 		if (

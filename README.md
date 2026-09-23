@@ -13,7 +13,7 @@ most logical next instruction you'd type and shows it. Three render modes:
 > **OMP editor-coexistence note:** `ghost`/`both` work on OMP too. OMP has no
 > public editor-owner getter, so next-prompt cannot detect another custom-editor
 > extension that installed first in the same session — the last installer wins
-> there (Pi captures and can restore the prior owner). If ghost rendering ever
+> there (Pi captures and can restore the prior owner). If the ghost install
 > fails, the default editor is restored and the mode falls back to widget.
 
 Accept with **`Alt-/`** (default; configurable) to fill the input box. The suggestion
@@ -281,11 +281,14 @@ Mitigations:
 **decorates** it without a warning and keeps its behavior. An extension that
 installs its editor later either wraps the ghost editor, which keeps it live, or
 discards it; on Pi only a discarded ghost is installed again, when the next
-suggestion is shown. Only if the ghost install or its render pass actually fails
-does the extension restore the prior owner and fall back to widget mode. On OMP
-there is no editor-owner getter, so a failed ghost restores the **default**
-editor instead; OMP also has no host-side extension-editor teardown, so
-next-prompt resets its editor to default at the next `session_start`. The host
+suggestion is shown. If the ghost fails, the mode falls back to widget. A failed
+install restores the owner that was current just before it; on OMP, which has no
+editor-owner getter, that is the **default** editor. A ghost that fails later,
+while rendering, leaves the editor slot alone, so extensions installed after it
+stay in place: the ghost editor stops drawing the ghost and passes everything
+else through. An error from the other extension's own render is passed through
+unchanged. OMP also has no host-side extension-editor teardown, so next-prompt
+resets its editor to default at the next `session_start`. The host
 clears extension listeners when the UI is reset; each fresh `session_start`
 (reload/new/resume/fork) re-registers exactly one listener and re-installs the
 editor once.
@@ -362,9 +365,9 @@ hosts. OMP-specific behavior:
 - Transport: OMP completes via `completeSimple` + the model registry's auth
   resolver; Pi keeps `modelRegistry.complete`.
 - Rendering: OMP supports `widget`, `ghost`, and `both`; because OMP has no
-  editor-owner getter, a ghost failure restores the default editor (Pi restores
-  the captured prior owner) and another custom-editor extension installed first
-  in the same session is not detected.
+  editor-owner getter, a failed ghost install restores the default editor (Pi
+  restores the captured prior owner) and another custom-editor extension
+  installed first in the same session is not detected.
 - Trust: OMP has no project-trust API; project config follows the loader default
   (global privacy floors and consent are unchanged).
 
