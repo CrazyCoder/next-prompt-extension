@@ -2676,7 +2676,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		state.fallbackToWidget = fallbackToWidget;
 		const factory = (tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
-			state.ghostBuiltUnder = ctx.ui.getEditorComponent?.();
+			// The factory can run inside another extension's editor build after
+			// this session's ctx is replaced; a throw here would break that
+			// build. Unknown ownership only costs a re-install at settle.
+			try {
+				state.ghostBuiltUnder = ctx.ui.getEditorComponent?.();
+			} catch {
+				state.ghostBuiltUnder = undefined;
+			}
 			// Step 5 (coexistence): when another editor owner exists (Pi),
 			// DECORATE it — construct the prior editor and overlay the ghost on
 			// its render, delegating input/text/callbacks so the other

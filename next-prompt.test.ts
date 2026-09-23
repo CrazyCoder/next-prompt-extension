@@ -2564,6 +2564,32 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
+	test("T75c: a wrapper built after the ctx went stale still gets a ghost editor (owner getter throws)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		const ui = (
+			fake.ctx as unknown as {
+				ui: {
+					getEditorComponent: () => (...a: unknown[]) => unknown;
+					setEditorComponent: (f: unknown) => void;
+				};
+			}
+		).ui;
+		const ours = ui.getEditorComponent();
+		expect(typeof ours).toBe("function");
+		ui.getEditorComponent = () => {
+			throw new Error("This extension ctx is stale");
+		};
+		// Throws out of the wrapper's build if the factory lets it escape.
+		ui.setEditorComponent((...a: unknown[]) => ours(...a));
+		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.lastEditorComponent === undefined).toBe(false);
+	});
+
 	test("C15: ghost decorates the prior editor — prior renders beneath, keys and text delegate (Step 5)", async () => {
 		class DistinctiveEditor {
 			focused = true;
