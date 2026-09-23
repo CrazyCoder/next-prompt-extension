@@ -6072,12 +6072,20 @@ describe("model picker", () => {
 		nav.type(KEY_DOWN, KEY_PAGE_DOWN);
 		const page = pickerVisibleRows(24);
 		expect(nav.selectedLine()).toBe(`→ provider-${page % 4}/model-${page}`);
+		// Lengths, not toEqual: toEqual ignores undefined array items, so
+		// `[]` would pass for a cancel that never happened.
 		nav.type(KEY_ESCAPE);
-		expect(nav.results).toEqual([undefined]);
+		expect(nav.results.length).toBe(1);
+		expect(nav.results[0]).toBeUndefined();
+		// The default select bindings cancel on Ctrl+C as well as Escape.
+		const interrupted = open();
+		interrupted.type("\u0003");
+		expect(interrupted.results.length).toBe(1);
+		expect(interrupted.results[0]).toBeUndefined();
 
 		const empty = open();
 		empty.type("z", "z", "z", KEY_ENTER);
-		expect(empty.results).toEqual([]);
+		expect(empty.results.length).toBe(0);
 		expect(empty.picker.render(80)).toContain("  No matching models");
 	});
 
