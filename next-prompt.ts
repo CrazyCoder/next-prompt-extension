@@ -3322,7 +3322,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 // ---------------------------------------------------------------------------
 // Picker for every choice in /next-prompt-config. The host's `ui.select` and
 // `ui.confirm` always open on their first option, so pressing Enter through
-// the dialogs changed settings, and select draws every option, so a long
+// the dialogs would change settings, and select draws every option, so a long
 // model list scrolls the terminal itself and hides the selection. Pi's own
 // model selector needs its internal ModelRuntime, which extensions cannot
 // reach. Only pieces both hosts export are used: OMP's SelectList takes a

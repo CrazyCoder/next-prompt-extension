@@ -4753,7 +4753,15 @@ test("T124: the render-mode picker lists ghost first and opens on the saved mode
 				}),
 		},
 	} as unknown as Parameters<typeof configureInteractively>[0];
-	await configureInteractively(ctx, { renderMode: "both" }, true);
+	const update = await configureInteractively(
+		ctx,
+		{ renderMode: "both", allowCrossProvider: true, debug: true, autoTrigger: false },
+		true,
+	);
+	// Every step after the model was cancelled, the yes/no ones included:
+	// a cancel keeps the saved value, so nothing is written.
+	const written = Object.entries(update ?? {}).filter(([, v]) => v !== undefined);
+	expect(written.length).toBe(0);
 	const rows = screens[1]!.filter((line) => /^(→ | {2})\S/.test(line));
 	expect(rows[0]?.includes("ghost")).toBe(true);
 	expect(rows[1]?.includes("widget")).toBe(true);
