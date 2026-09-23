@@ -81,8 +81,11 @@ import {
 import {
 	matchesKey,
 	CURSOR_MARKER,
+	fuzzyFilter,
+	Input,
 	truncateToWidth,
 	visibleWidth,
+	type Component,
 	type EditorTheme,
 	type KeyId,
 	type TUI,
@@ -3286,6 +3289,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			const next = await configureInteractively(
 				ctx as unknown as Parameters<typeof configureInteractively>[0],
 				loadConfig(ctx.cwd),
+				true,
 			);
 			if (next) {
 				const saved = saveConfig(next);
@@ -3314,6 +3318,213 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 }
 
+// ---------------------------------------------------------------------------
+// Model picker: a searchable list sized to the terminal. The host's
+// `ui.select` draws every option, so a long model list scrolls the terminal
+// itself and hides the selection. Pi's own model selector needs its internal
+// ModelRuntime, which extensions cannot reach. Only pieces both hosts export
+// are used: OMP's SelectList takes a different theme shape than Pi's.
+// ---------------------------------------------------------------------------
+
+export interface PickerItem {
+	value: string;
+	label: string;
+}
+
+type PickerTheme = {
+	fg(color: string, text: string): string;
+	bold(text: string): string;
+};
+
+type PickerComponent = Component & {
+	focused: boolean;
+	handleInput(data: string): void;
+	// Optional on OMP's Component, always provided here.
+	invalidate(): void;
+};
+
+type PickerUi = {
+	select: (title: string, options: string[]) => Promise<string | undefined>;
+	custom?: <T>(
+		factory: (
+			tui: TUI,
+			theme: PickerTheme,
+			keybindings: unknown,
+			done: (result: T) => void,
+		) => Component | Promise<Component>,
+	) => Promise<T>;
+};
+
+// The picker draws two borders, a title, the search line, a scroll-position
+// line and a key hint around the list. The host's footer and status lines
+// stay below it, so those rows are kept free too.
+const PICKER_CHROME_ROWS = 6;
+const PICKER_RESERVED_ROWS = 6;
+const PICKER_MIN_VISIBLE = 3;
+const PICKER_MAX_VISIBLE = 15;
+const PICKER_HINT =
+	"type to search • ↑↓ PgUp PgDn move • enter select • esc cancel";
+
+export function pickerVisibleRows(terminalRows: number): number {
+	return Math.max(
+		PICKER_MIN_VISIBLE,
+		Math.min(
+			PICKER_MAX_VISIBLE,
+			terminalRows - PICKER_CHROME_ROWS - PICKER_RESERVED_ROWS,
+		),
+	);
+}
+
+/**
+ * A searchable list that shows at most `pickerVisibleRows` items and scrolls
+ * inside that window. It opens on `initialValue`, marked with a check.
+ */
+export function createPicker(
+	title: string,
+	items: readonly PickerItem[],
+	initialValue: string | undefined,
+	theme: PickerTheme,
+	terminalRows: () => number,
+	done: (value: string | undefined) => void,
+): PickerComponent {
+	const input = new Input();
+	input.focused = true;
+	let filtered = [...items];
+	let selected = Math.max(
+		0,
+		filtered.findIndex((item) => item.value === initialValue),
+	);
+
+	const refilter = () => {
+		const query = input.getValue();
+		filtered = fuzzyFilter([...items], query, (item) => item.label);
+		selected = query.trim()
+			? 0
+			: Math.max(
+					0,
+					filtered.findIndex((item) => item.value === initialValue),
+				);
+	};
+	const move = (delta: number, wrap: boolean) => {
+		if (filtered.length === 0) return;
+		const target = selected + delta;
+		if (wrap) selected = (target + filtered.length) % filtered.length;
+		else selected = Math.max(0, Math.min(filtered.length - 1, target));
+	};
+
+	return {
+		get focused() {
+			return input.focused;
+		},
+		set focused(value: boolean) {
+			input.focused = value;
+		},
+		render(width: number): string[] {
+			const visible = pickerVisibleRows(terminalRows());
+			const start = Math.max(
+				0,
+				Math.min(
+					selected - Math.floor(visible / 2),
+					filtered.length - visible,
+				),
+			);
+			const border = theme.fg("accent", "─".repeat(Math.max(1, width)));
+			const lines = [
+				border,
+				theme.fg("accent", theme.bold(truncateToWidth(title, width))),
+				...input.render(width),
+			];
+			if (filtered.length === 0)
+				lines.push(theme.fg("muted", "  No matching models"));
+			for (
+				let i = start;
+				i < Math.min(start + visible, filtered.length);
+				i++
+			) {
+				const item = filtered[i]!;
+				const mark = item.value === initialValue ? " ✓" : "";
+				const text = truncateToWidth(
+					`${i === selected ? "→ " : "  "}${item.label}${mark}`,
+					width,
+				);
+				lines.push(i === selected ? theme.fg("accent", text) : text);
+			}
+			lines.push(
+				filtered.length > visible
+					? theme.fg("muted", `  (${selected + 1}/${filtered.length})`)
+					: "",
+			);
+			lines.push(theme.fg("dim", truncateToWidth(PICKER_HINT, width)), border);
+			return lines;
+		},
+		invalidate() {
+			input.invalidate();
+		},
+		handleInput(data: string) {
+			if (matchesKey(data, "escape")) done(undefined);
+			else if (matchesKey(data, "enter")) {
+				const item = filtered[selected];
+				if (item) done(item.value);
+			} else if (matchesKey(data, "up")) move(-1, true);
+			else if (matchesKey(data, "down")) move(1, true);
+			else if (matchesKey(data, "pageUp"))
+				move(-pickerVisibleRows(terminalRows()), false);
+			else if (matchesKey(data, "pageDown"))
+				move(pickerVisibleRows(terminalRows()), false);
+			else {
+				input.handleInput(data);
+				refilter();
+			}
+		},
+	};
+}
+
+/**
+ * Pick one item: the terminal-sized picker in the TUI, the host's plain
+ * select elsewhere (RPC mode cannot draw custom components). Undefined on
+ * cancel.
+ */
+export async function pickItem(
+	ui: PickerUi,
+	tui: boolean,
+	title: string,
+	items: readonly PickerItem[],
+	initialValue: string | undefined,
+): Promise<string | undefined> {
+	if (tui && ui.custom) {
+		return ui.custom<string | undefined>((host, theme, _keybindings, done) => {
+			const picker = createPicker(
+				title,
+				items,
+				initialValue,
+				theme,
+				() => host.terminal.rows,
+				done,
+			);
+			const component: PickerComponent = {
+				get focused() {
+					return picker.focused;
+				},
+				set focused(value: boolean) {
+					picker.focused = value;
+				},
+				render: (width: number) => picker.render(width),
+				invalidate: () => picker.invalidate(),
+				handleInput(data: string) {
+					picker.handleInput(data);
+					host.requestRender();
+				},
+			};
+			return component;
+		});
+	}
+	const label = await ui.select(
+		title,
+		items.map((item) => item.label),
+	);
+	return items.find((item) => item.label === label)?.value;
+}
+
 /**
  * Interactive config flow. Returns a partial NextPromptConfig to merge+save, or undefined
  * if the user cancelled at the first prompt. Pure-ish (reads models via ctx.modelRegistry;
@@ -3328,25 +3539,41 @@ export async function configureInteractively(
 				placeholder?: string,
 			) => Promise<string | undefined>;
 			confirm: (title: string, message: string) => Promise<boolean>;
+			custom?: PickerUi["custom"];
 		};
 		modelRegistry: {
 			getAvailable(): Array<{ provider: string; id: string; name?: string }>;
 		};
 	},
 	current: NextPromptConfig,
+	tui = false,
 ): Promise<Partial<NextPromptConfig> | undefined> {
 	const update: Partial<NextPromptConfig> = {};
 
 	// 1. Suggestion model (picker over all available models, or "use current").
-	const models = ctx.modelRegistry
-		.getAvailable()
-		.map((m) => formatModelOption(m));
+	const available = ctx.modelRegistry.getAvailable();
+	const models = available.map((m) => formatModelOption(m));
 	const currentLabel = current.model
 		? formatModelOption({ ...current.model, id: current.model.model })
 		: "(use current model)";
-	const modelPick = await ctx.ui.select(
+	// The saved model's label as the picker lists it (with the model's name),
+	// so the picker can open on it.
+	const savedModel = current.model
+		? available.find(
+				(m) =>
+					m.provider === current.model!.provider &&
+					m.id === current.model!.model,
+			)
+		: undefined;
+	const modelPick = await pickItem(
+		ctx.ui,
+		tui,
 		`next-prompt: suggestion model [${currentLabel}]`,
-		["(use current model)", ...models],
+		["(use current model)", ...models].map((label) => ({
+			value: label,
+			label,
+		})),
+		savedModel ? formatModelOption(savedModel) : "(use current model)",
 	);
 	if (modelPick === undefined) return undefined;
 	if (modelPick === "(use current model)") update.model = undefined;

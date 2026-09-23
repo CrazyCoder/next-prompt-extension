@@ -32,6 +32,7 @@ import {
 	buildTranscript,
 	configureInteractively,
 	consentChoiceFromLabel,
+	createPicker,
 	DEFAULT_ACCEPT_KEY,
 	destinationKey,
 	destinationOf,
@@ -46,6 +47,8 @@ import {
 	MAX_SESSION_ID_CHARS,
 	overlayGhost,
 	parseModelOption,
+	pickerVisibleRows,
+	pickItem,
 	projectTrustedForHost,
 	redactSecrets,
 	resolveSuggestionModel,
@@ -5994,4 +5997,159 @@ describe("suggestion quality corpus (deterministic)", () => {
 			expect(sanitizeSuggestion(raw, {})).toBe(expected);
 		});
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Model picker (terminal-sized, searchable)
+// ---------------------------------------------------------------------------
+
+describe("model picker", () => {
+	const KEY_UP = "\u001b[A";
+	const KEY_DOWN = "\u001b[B";
+	const KEY_PAGE_DOWN = "\u001b[6~";
+	const KEY_ENTER = "\r";
+	const KEY_ESCAPE = "\u001b";
+	const plainTheme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+	const items = Array.from({ length: 100 }, (_, i) => {
+		const label = `provider-${i % 4}/model-${i}`;
+		return { value: label, label };
+	});
+
+	function open(initialValue?: string, rows = 24) {
+		const results: Array<string | undefined> = [];
+		const picker = createPicker(
+			"Pick a model",
+			items,
+			initialValue,
+			plainTheme,
+			() => rows,
+			(value) => results.push(value),
+		);
+		const type = (...keys: string[]) =>
+			keys.forEach((key) => picker.handleInput(key));
+		const selectedLine = () =>
+			picker.render(80).find((line) => line.startsWith("→ "));
+		return { picker, results, type, selectedLine };
+	}
+
+	test("P1: never taller than the terminal, never wider than it", () => {
+		for (const rows of [10, 16, 24, 40, 80]) {
+			const lines = open(undefined, rows).picker.render(80);
+			expect(lines.length).toBe(6 + pickerVisibleRows(rows));
+			expect(lines.length).toBeLessThanOrEqual(Math.max(rows, 9));
+			expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+		}
+		expect(pickerVisibleRows(10)).toBe(3);
+		expect(pickerVisibleRows(200)).toBe(15);
+	});
+
+	test("P2: opens on the saved value and marks it", () => {
+		expect(open("provider-2/model-82").selectedLine()).toBe(
+			"→ provider-2/model-82 ✓",
+		);
+		expect(open("gone/model").selectedLine()).toBe("→ provider-0/model-0");
+	});
+
+	test("P3: typing filters, Enter picks the top match, clearing restores", () => {
+		const typed = open("provider-2/model-82");
+		typed.type("7", "7");
+		expect(/model-77\b/.test(typed.selectedLine() ?? "")).toBe(true);
+		typed.type(KEY_ENTER);
+		expect(typed.results).toEqual(["provider-1/model-77"]);
+
+		const cleared = open("provider-2/model-82");
+		cleared.type("7", "\u007f");
+		expect(cleared.selectedLine()).toBe("→ provider-2/model-82 ✓");
+	});
+
+	test("P4: arrows wrap, page keys move a page, Escape cancels", () => {
+		const nav = open();
+		nav.type(KEY_UP);
+		expect(nav.selectedLine()).toBe("→ provider-3/model-99");
+		nav.type(KEY_DOWN, KEY_PAGE_DOWN);
+		const page = pickerVisibleRows(24);
+		expect(nav.selectedLine()).toBe(`→ provider-${page % 4}/model-${page}`);
+		nav.type(KEY_ESCAPE);
+		expect(nav.results).toEqual([undefined]);
+
+		const empty = open();
+		empty.type("z", "z", "z", KEY_ENTER);
+		expect(empty.results).toEqual([]);
+		expect(empty.picker.render(80)).toContain("  No matching models");
+	});
+
+	test("P5: pickItem draws the picker in the TUI and select elsewhere", async () => {
+		const customUi = {
+			select: async () => {
+				throw new Error("the TUI must not fall back to select");
+			},
+			custom: <T,>(factory: (...args: never[]) => unknown) =>
+				new Promise<T>((resolve) => {
+					const host = { terminal: { rows: 24 }, requestRender() {} };
+					const component = (
+						factory as unknown as (
+							h: typeof host,
+							t: typeof plainTheme,
+							k: unknown,
+							d: (v: T) => void,
+						) => { handleInput(data: string): void }
+					)(host, plainTheme, {}, resolve);
+					component.handleInput(KEY_DOWN);
+					component.handleInput(KEY_ENTER);
+				}),
+		};
+		expect(
+			await pickItem(
+				customUi as unknown as Parameters<typeof pickItem>[0],
+				true,
+				"Pick",
+				items,
+				"provider-0/model-0",
+			),
+		).toBe("provider-1/model-1");
+
+		const selectUi = { select: async (_t: string, options: string[]) => options[3] };
+		expect(await pickItem(selectUi, false, "Pick", items, undefined)).toBe(
+			"provider-3/model-3",
+		);
+	});
+
+	test("P6: the config wizard opens the picker on the saved model", async () => {
+		let initialSelected: string | undefined;
+		const ctx = makeConfigCtx({
+			models: [
+				{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" },
+				{ provider: "openai", id: "gpt-6-luna", name: "GPT-6 Luna" },
+			],
+			answers: {},
+		});
+		(ctx.ui as { custom?: unknown }).custom = <T,>(
+			factory: (...args: never[]) => unknown,
+		) =>
+			new Promise<T>((resolve) => {
+				const host = { terminal: { rows: 24 }, requestRender() {} };
+				const component = (
+					factory as unknown as (
+						h: typeof host,
+						t: typeof plainTheme,
+						k: unknown,
+						d: (v: T) => void,
+					) => { render(w: number): string[]; handleInput(d: string): void }
+				)(host, plainTheme, {}, resolve);
+				initialSelected = component
+					.render(100)
+					.find((line) => line.startsWith("→ "));
+				component.handleInput(KEY_ESCAPE);
+			});
+		const out = await configureInteractively(
+			ctx,
+			{ model: { provider: "openai", model: "gpt-6-luna" } },
+			true,
+		);
+		expect(out).toBeUndefined();
+		expect(initialSelected).toBe("→ openai/gpt-6-luna — GPT-6 Luna ✓");
+	});
 });

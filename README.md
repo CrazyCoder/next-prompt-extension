@@ -150,7 +150,8 @@ Restart `pi` (or start a new session) after installing.
 
 Run the `/next-prompt-config` slash command for a guided walkthrough of
 **every configurable option except `systemPrompt`** (that one is config-file-only) —
-a model picker (lists all available models), render mode, thinking level, accept
+a model picker over all available models (type to search; the list scrolls inside
+a window sized to the terminal and opens on the saved model), render mode, thinking level, accept
 key, re-arm delay, transcript/recent-turn/suggestion caps, and cross-provider
 disclosure. Changes are saved to the host agent dir
 (`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP)
