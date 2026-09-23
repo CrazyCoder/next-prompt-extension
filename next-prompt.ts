@@ -2209,6 +2209,8 @@ interface PriorEditorLike {
 	setAutocompleteMaxVisible?: (max: number) => void;
 	setAutocompleteProvider?: (provider: unknown) => void;
 	invalidate?: () => void;
+	/** pi's CustomEditor app-action map (keybinding action → handler). */
+	actionHandlers?: Map<string, () => void>;
 	onSubmit?: (text: string) => void;
 	onChange?: (text: string) => void;
 	onEscape?: () => void;
@@ -2256,6 +2258,14 @@ class DecoratingGhostEditor extends CustomEditor {
 				},
 				configurable: true,
 			});
+		}
+		// pi copies its app actions (Ctrl+C clear/exit, Ctrl+Z, model and
+		// thinking cycling, ...) into the TOP editor's actionHandlers map, but
+		// every key is dispatched by the prior: share the prior's map so those
+		// actions land where the keys are handled.
+		if (this.prior.actionHandlers instanceof Map) {
+			(this as unknown as { actionHandlers: unknown }).actionHandlers =
+				this.prior.actionHandlers;
 		}
 	}
 

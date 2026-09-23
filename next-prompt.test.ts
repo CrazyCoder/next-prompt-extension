@@ -2866,6 +2866,39 @@ describe("controller wiring (agent_settled)", () => {
 		expect(lines[0]).toBe(priorLines[0]);
 	});
 
+	test("C20: app actions pi wires onto the decorator reach the prior editor (Ctrl+C clear/exit with pi-ext-bar-cursor)", async () => {
+		// The prior is a real CustomEditor, like pi-ext-bar-cursor's, which
+		// dispatches app actions from its own actionHandlers map.
+		const kb = {
+			matches: (data: string, action: string) =>
+				action === "app.clear" && data === "\x03",
+		};
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			priorEditorFactory: (tui, theme) =>
+				new CustomEditor(tui as never, theme as never, kb as never),
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const ed = fake.lastEditorComponent as unknown as {
+			actionHandlers: Map<string, () => void>;
+			handleInput: (data: string) => void;
+		};
+		// What pi's setCustomEditorComponent does to the component it installs.
+		let clears = 0;
+		ed.actionHandlers.set("app.clear", () => {
+			clears += 1;
+		});
+		ed.handleInput("\x03");
+		ed.handleInput("\x03");
+		expect(clears).toBe(2);
+	});
+
 	test("T73: default model = ctx.model when config has no model block", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
