@@ -1771,7 +1771,8 @@ export interface SuggestionState {
 	 * The editor owner Pi was installing when our ghost factory last ran (Pi
 	 * ghost-ownership check). Pi assigns the owner before it calls the factory,
 	 * so this is our own factory for our install, or the outermost factory of
-	 * an extension whose editor wraps ours.
+	 * an extension whose editor wraps ours. Undefined when the owner could not
+	 * be read, which makes the check re-install.
 	 */
 	ghostBuiltUnder?: unknown;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
