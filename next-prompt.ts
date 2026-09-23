@@ -1767,8 +1767,13 @@ export interface SuggestionState {
 	 * never attempted (widget-only sessions).
 	 */
 	fallbackToWidget: (() => void) | undefined;
-	/** Identity of the factory we last installed (Pi ghost-ownership check). */
-	ghostFactory?: unknown;
+	/**
+	 * The editor owner Pi was installing when our ghost factory last ran (Pi
+	 * ghost-ownership check). Pi assigns the owner before it calls the factory,
+	 * so this is our own factory for our install, or the outermost factory of
+	 * an extension whose editor wraps ours.
+	 */
+	ghostBuiltUnder?: unknown;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
 	/** True while a suggestion request is in flight (manual-trigger no-op guard). */
@@ -2650,7 +2655,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (state.renderMode === "widget") return;
 			state.renderMode = "widget";
 			state.renderGhost = undefined;
-			state.ghostFactory = undefined;
+			state.ghostBuiltUnder = undefined;
 			editorInstalled = false;
 			editorInstalledForHost = false;
 			// Restore the previous owner (or the default editor) so the other
@@ -2671,6 +2676,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		state.fallbackToWidget = fallbackToWidget;
 		const factory = (tui: TUI, theme: EditorTheme, kb: KeybindingsManager) => {
+			state.ghostBuiltUnder = ctx.ui.getEditorComponent?.();
 			// Step 5 (coexistence): when another editor owner exists (Pi),
 			// DECORATE it — construct the prior editor and overlay the ghost on
 			// its render, delegating input/text/callbacks so the other
@@ -2696,7 +2702,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			};
 			return ed;
 		};
-		state.ghostFactory = factory;
 		try {
 			ctx.ui.setEditorComponent?.(factory as never);
 			editorInstalled = true;
@@ -2784,7 +2789,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			publishWidget,
 			renderGhost: undefined,
 			fallbackToWidget: undefined,
-			ghostFactory: undefined,
+			ghostBuiltUnder: undefined,
 			abortInflight: () => {
 				ref.inflight?.abort();
 				ref.inflight = undefined;
@@ -3151,14 +3156,17 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// editor — pi-powerline-footer installs its editorFactory at session
 		// start AFTER us, and pi's tree is last-installer-wins. Our
 		// GhostEditor is discarded and the ghost can never paint, with no
-		// error raised. If Pi's getter no longer returns our factory,
-		// install on top again; the current owner becomes the restore
-		// target of a later ghost-failure fallback.
+		// error raised. If the current owner was not the one being installed
+		// when our factory last ran, our editor is not in the tree: install on
+		// top again, and the current owner becomes the restore target of a
+		// later ghost-failure fallback. An owner that wraps our editor
+		// (pi-contextual-stash, pi-clear-hotkey) runs our factory inside its
+		// own, so the ghost is still live and nothing is re-installed.
 		if (
 			clean &&
 			state.renderMode !== "widget" &&
 			typeof ctx.ui.getEditorComponent === "function" &&
-			ctx.ui.getEditorComponent() !== state.ghostFactory
+			ctx.ui.getEditorComponent() !== state.ghostBuiltUnder
 		) {
 			diag("ghost_reacquire");
 			installGhostEditor(ctx, state);

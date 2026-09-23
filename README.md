@@ -277,14 +277,16 @@ Mitigations:
 `ctx.hasUI === true`; headless/RPC/JSON sessions never compute), a global
 `ctx.ui.onTerminalInput` listener is registered to detect the accept key
 **editor-independently**. `ghost`/`both` install a render-only `GhostEditor` via
-`setEditorComponent` — never re-installed on settle. If another extension owns
-the editor on Pi, the ghost **decorates** it without a warning and keeps its
-behavior; only if the ghost install or its render pass actually fails does the
-extension restore the prior owner and fall back to widget mode. On OMP there is
-no editor-owner getter, so a failed ghost restores the **default** editor
-instead; OMP also has no host-side extension-editor teardown, so next-prompt
-resets its editor to default at the next `session_start`. The host clears
-extension listeners when the UI is reset; each fresh `session_start`
+`setEditorComponent`. If another extension owns the editor on Pi, the ghost
+**decorates** it without a warning and keeps its behavior. An extension that
+installs its editor later either wraps the ghost editor, which keeps it live, or
+discards it; on Pi only a discarded ghost is installed again, when the next
+suggestion is shown. Only if the ghost install or its render pass actually fails
+does the extension restore the prior owner and fall back to widget mode. On OMP
+there is no editor-owner getter, so a failed ghost restores the **default**
+editor instead; OMP also has no host-side extension-editor teardown, so
+next-prompt resets its editor to default at the next `session_start`. The host
+clears extension listeners when the UI is reset; each fresh `session_start`
 (reload/new/resume/fork) re-registers exactly one listener and re-installs the
 editor once.
 2. On completion:

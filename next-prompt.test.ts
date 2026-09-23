@@ -2523,6 +2523,47 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
+	test("T75b: owners that wrap the ghost editor after install → ghost kept live, not re-installed (pi-contextual-stash + pi-clear-hotkey)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "ghost suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const ui = (
+			fake.ctx as unknown as {
+				ui: {
+					getEditorComponent: () => (...a: unknown[]) => unknown;
+					setEditorComponent: (f: unknown) => void;
+				};
+			}
+		).ui;
+		// Each wrapper builds the previous owner's editor inside its own, the
+		// way both extensions do at session start.
+		for (let i = 0; i < 2; i++) {
+			const previous = ui.getEditorComponent();
+			ui.setEditorComponent((...a: unknown[]) => previous(...a));
+		}
+		const ghostInTree = fake.lastEditorComponent;
+		expect(ghostInTree === undefined).toBe(false);
+		const callsAfterWrap = fake.editorComponentCalls;
+		const rendersBefore = fake.requestRenderCalls;
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.editorComponentCalls).toBe(callsAfterWrap);
+		expect(fake.lastEditorComponent === ghostInTree).toBe(true);
+		expect(fake.requestRenderCalls).toBeGreaterThan(rendersBefore);
+		expect(fake.calls.notifies).toHaveLength(0);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
 	test("C15: ghost decorates the prior editor — prior renders beneath, keys and text delegate (Step 5)", async () => {
 		class DistinctiveEditor {
 			focused = true;
