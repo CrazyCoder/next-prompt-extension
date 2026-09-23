@@ -2190,8 +2190,9 @@ export { GhostEditor };
 // editorFactory at session start), pi's tree is last-installer-wins: replacing
 // the component silently discards the other extension's editor behavior.
 // Instead, the ghost DECORATES the prior editor instance: the prior renders
-// beneath, every keystroke/text/callback is delegated to it, and the ghost
-// suggestion is overlaid on its render. The other extension stays live.
+// beneath, every keystroke/text/callback and pi's app-action map are
+// delegated to it, and the ghost suggestion is overlaid on its render. The
+// other extension stays live.
 
 /** Structural surface the decorated prior editor exposes (opaque to us). */
 interface PriorEditorLike {

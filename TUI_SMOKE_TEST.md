@@ -76,6 +76,9 @@ Run each sequence in `widget`, `ghost`, and `both`:
   warning, decorates it in ghost mode, and only falls back to widget mode if
   ghost rendering actually fails (the other extension's editor keeps working,
   suggestion still appears below the box).
+- [ ] With another custom-editor extension installed first, pi's own keys keep
+  working through the decorated editor: Ctrl+C clears the editor, a second
+  Ctrl+C exits, and Ctrl+D on an empty editor exits.
 
 ### Model / lifecycle error paths
 
