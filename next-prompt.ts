@@ -3320,16 +3320,23 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 }
 
 // ---------------------------------------------------------------------------
-// Model picker: a searchable list sized to the terminal. The host's
-// `ui.select` draws every option, so a long model list scrolls the terminal
-// itself and hides the selection. Pi's own model selector needs its internal
-// ModelRuntime, which extensions cannot reach. Only pieces both hosts export
-// are used: OMP's SelectList takes a different theme shape than Pi's.
+// Picker for every choice in /next-prompt-config. The host's `ui.select` and
+// `ui.confirm` always open on their first option, so pressing Enter through
+// the dialogs changed settings, and select draws every option, so a long
+// model list scrolls the terminal itself and hides the selection. Pi's own
+// model selector needs its internal ModelRuntime, which extensions cannot
+// reach. Only pieces both hosts export are used: OMP's SelectList takes a
+// different theme shape than Pi's.
 // ---------------------------------------------------------------------------
 
 export interface PickerItem {
 	value: string;
 	label: string;
+}
+
+export interface PickerOptions {
+	/** Show a search line and filter as the user types. For long lists. */
+	search?: boolean;
 }
 
 type PickerTheme = {
@@ -3363,8 +3370,8 @@ const PICKER_CHROME_ROWS = 6;
 const PICKER_RESERVED_ROWS = 6;
 const PICKER_MIN_VISIBLE = 3;
 const PICKER_MAX_VISIBLE = 15;
-const PICKER_HINT =
-	"type to search • ↑↓ PgUp PgDn move • enter select • esc cancel";
+const PICKER_HINT = "↑↓ PgUp PgDn move • enter select • esc cancel";
+const PICKER_SEARCH_HINT = `type to search • ${PICKER_HINT}`;
 
 export function pickerVisibleRows(terminalRows: number): number {
 	return Math.max(
@@ -3377,8 +3384,8 @@ export function pickerVisibleRows(terminalRows: number): number {
 }
 
 /**
- * A searchable list that shows at most `pickerVisibleRows` items and scrolls
- * inside that window. It opens on `initialValue`, marked with a check.
+ * A list that shows at most `pickerVisibleRows` items and scrolls inside that
+ * window. It opens on `initialValue`, marked with a check, so Enter keeps it.
  */
 export function createPicker(
 	title: string,
@@ -3387,6 +3394,7 @@ export function createPicker(
 	theme: PickerTheme,
 	terminalRows: () => number,
 	done: (value: string | undefined) => void,
+	{ search = false }: PickerOptions = {},
 ): PickerComponent {
 	const input = new Input();
 	input.focused = true;
@@ -3433,10 +3441,9 @@ export function createPicker(
 			const lines = [
 				border,
 				theme.fg("accent", theme.bold(truncateToWidth(title, width))),
-				...input.render(width),
 			];
-			if (filtered.length === 0)
-				lines.push(theme.fg("muted", "  No matching models"));
+			if (search) lines.push(...input.render(width));
+			if (filtered.length === 0) lines.push(theme.fg("muted", "  No matches"));
 			for (
 				let i = start;
 				i < Math.min(start + visible, filtered.length);
@@ -3455,7 +3462,13 @@ export function createPicker(
 					? theme.fg("muted", `  (${selected + 1}/${filtered.length})`)
 					: "",
 			);
-			lines.push(theme.fg("dim", truncateToWidth(PICKER_HINT, width)), border);
+			lines.push(
+				theme.fg(
+					"dim",
+					truncateToWidth(search ? PICKER_SEARCH_HINT : PICKER_HINT, width),
+				),
+				border,
+			);
 			return lines;
 		},
 		invalidate() {
@@ -3474,7 +3487,7 @@ export function createPicker(
 				move(-pickerVisibleRows(terminalRows()), false);
 			else if (keys.matches(data, "tui.select.pageDown"))
 				move(pickerVisibleRows(terminalRows()), false);
-			else {
+			else if (search) {
 				input.handleInput(data);
 				refilter();
 			}
@@ -3484,8 +3497,9 @@ export function createPicker(
 
 /**
  * Pick one item: the terminal-sized picker in the TUI, the host's plain
- * select elsewhere (RPC mode cannot draw custom components). Undefined on
- * cancel.
+ * select elsewhere (RPC mode cannot draw custom components). Plain select
+ * always opens on its first option, so there the initial item is listed
+ * first. Undefined on cancel.
  */
 export async function pickItem(
 	ui: PickerUi,
@@ -3493,6 +3507,7 @@ export async function pickItem(
 	title: string,
 	items: readonly PickerItem[],
 	initialValue: string | undefined,
+	options: PickerOptions = {},
 ): Promise<string | undefined> {
 	if (tui && ui.custom) {
 		return ui.custom<string | undefined>((host, theme, _keybindings, done) => {
@@ -3503,6 +3518,7 @@ export async function pickItem(
 				theme,
 				() => host.terminal.rows,
 				done,
+				options,
 			);
 			const component: PickerComponent = {
 				get focused() {
@@ -3521,9 +3537,13 @@ export async function pickItem(
 			return component;
 		});
 	}
+	const ordered = [
+		...items.filter((item) => item.value === initialValue),
+		...items.filter((item) => item.value !== initialValue),
+	];
 	const label = await ui.select(
 		title,
-		items.map((item) => item.label),
+		ordered.map((item) => item.label),
 	);
 	return items.find((item) => item.label === label)?.value;
 }
@@ -3541,7 +3561,6 @@ export async function configureInteractively(
 				title: string,
 				placeholder?: string,
 			) => Promise<string | undefined>;
-			confirm: (title: string, message: string) => Promise<boolean>;
 			custom?: PickerUi["custom"];
 		};
 		modelRegistry: {
@@ -3577,6 +3596,7 @@ export async function configureInteractively(
 			label,
 		})),
 		savedModel ? formatModelOption(savedModel) : "(use current model)",
+		{ search: true },
 	);
 	if (modelPick === undefined) return undefined;
 	if (modelPick === "(use current model)") update.model = undefined;
@@ -3604,18 +3624,25 @@ export async function configureInteractively(
 		"both — inline ghost AND the below-editor line",
 	];
 	const currentRenderLabel = current.renderMode ?? "widget";
-	const renderPick = await ctx.ui.select(
+	const renderPick = await pickItem(
+		ctx.ui,
+		tui,
 		`next-prompt: render mode [${currentRenderLabel}]`,
-		renderOptions,
+		renderOptions.map((label) => ({ value: label.split(" — ")[0]!, label })),
+		currentRenderLabel,
 	);
-	if (renderPick) update.renderMode = renderPick.split(" — ")[0] as RenderMode;
+	if (renderPick && renderPick !== currentRenderLabel)
+		update.renderMode = renderPick as RenderMode;
 
 	// 3. thinking level
-	const thinkPick = await ctx.ui.select(
+	const thinkPick = await pickItem(
+		ctx.ui,
+		tui,
 		`next-prompt: thinking level [${current.thinking ?? "(unset)"}]`,
-		[...THINKING_OPTIONS],
+		THINKING_OPTIONS.map((label) => ({ value: label, label })),
+		current.thinking ?? THINKING_OPTIONS[0],
 	);
-	if (thinkPick)
+	if (thinkPick && thinkPick !== (current.thinking ?? THINKING_OPTIONS[0]))
 		update.thinking =
 			thinkPick === THINKING_OPTIONS[0]
 				? undefined
@@ -3654,18 +3681,22 @@ export async function configureInteractively(
 			update.maxTranscriptChars = n;
 	}
 
-	// 7. maxRecentTurns (numeric text; disclosure minimization). Empty input
-	// means "all turns" — if a cap is saved, mark it for deletion so the
-	// file returns to the default (the Step-0 footgun: an empty input used
-	// to silently keep the saved cap).
-	const rtPick = await ctx.ui.input(
-		`next-prompt: max recent turns sent in transcript (empty = all, deletes the saved cap) [${current.maxRecentTurns ?? "all"}]`,
-		current.maxRecentTurns === undefined ? "" : String(current.maxRecentTurns),
-	);
-	if (rtPick !== undefined && rtPick.trim().length === 0) {
+	// 7. maxRecentTurns (numeric text; disclosure minimization). An empty
+	// answer keeps the saved value, as in every other step, so pressing Enter
+	// through the dialogs changes nothing. "all" removes a saved cap and the
+	// file returns to the default of all turns.
+	const rtPick = (
+		await ctx.ui.input(
+			`next-prompt: max recent turns sent in transcript ("all" removes the cap) [${current.maxRecentTurns ?? "all"}]`,
+			current.maxRecentTurns === undefined
+				? "all"
+				: String(current.maxRecentTurns),
+		)
+	)?.trim();
+	if (rtPick?.toLowerCase() === "all") {
 		if (current.maxRecentTurns !== undefined) update.maxRecentTurns = undefined;
-	} else if (rtPick && rtPick.trim().length > 0) {
-		const n = Number(rtPick.trim());
+	} else if (rtPick) {
+		const n = Number(rtPick);
 		if (Number.isInteger(n) && n >= MIN_RECENT_TURNS && n <= MAX_RECENT_TURNS)
 			update.maxRecentTurns = n;
 	}
@@ -3685,28 +3716,60 @@ export async function configureInteractively(
 			update.maxSuggestionChars = n;
 	}
 
-	// 9. allowCrossProvider (confirm)
-	const cross = await ctx.ui.confirm(
-		`next-prompt: allow cross-provider suggestion (sends transcript to a different provider)? [${current.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER}]`,
-		"Yes = use the configured model even if it's on a different provider (requires per-project consent). No = fall back to the current model.",
-	);
-	update.allowCrossProvider = cross;
+	// 9–11. Yes/no settings. A two-item picker rather than `ui.confirm`, which
+	// always opens on "Yes": pressing Enter would allow cross-provider
+	// disclosure and switch the log on. Each opens on its current value.
+	// Undefined means no change — a cancel, or the current value picked again —
+	// so a click-through writes no key the file did not already have.
+	const askYesNo = async (
+		title: string,
+		currentValue: boolean,
+		yes: string,
+		no: string,
+	): Promise<boolean | undefined> => {
+		const pick = await pickItem(
+			ctx.ui,
+			tui,
+			`${title} [${currentValue ? "yes" : "no"}]`,
+			[
+				{ value: "yes", label: `yes — ${yes}` },
+				{ value: "no", label: `no — ${no}` },
+			],
+			currentValue ? "yes" : "no",
+		);
+		if (pick === undefined) return undefined;
+		const value = pick === "yes";
+		return value === currentValue ? undefined : value;
+	};
 
-	// 10. debug (confirm, opt-in). Absent means off; declining clears a saved
-	// true so the file returns to the default.
-	const debugPick = await ctx.ui.confirm(
-		`next-prompt: write the diagnostic log (next-prompt-debug.log)? [${current.debug ? "on" : "off"}]`,
-		"Entries are labels and sizes only — never transcript or suggestion text. Off = no log file is written.",
+	// 9. allowCrossProvider
+	const cross = await askYesNo(
+		"next-prompt: allow cross-provider suggestion (sends transcript to a different provider)?",
+		current.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER,
+		"use the configured model even on a different provider (per-project consent)",
+		"fall back to the current model",
 	);
-	if (typeof debugPick === "boolean") update.debug = debugPick ? true : undefined;
+	if (cross !== undefined) update.allowCrossProvider = cross;
 
-	// 11. autoTrigger (confirm): false = manual-only (the accept key doubles
-	// as the manual trigger), true = restore settle-triggered suggestions.
-	const autoPick = await ctx.ui.confirm(
-		`next-prompt: auto-trigger after each turn? [${current.autoTrigger ?? DEFAULT_AUTO_TRIGGER}]`,
-		"Yes = automatically suggest after every settled turn. No = manual-only (press the accept key to generate, then again to accept).",
+	// 10. debug (opt-in). Absent means off; declining clears a saved true so
+	// the file returns to the default.
+	const debugPick = await askYesNo(
+		"next-prompt: write the diagnostic log (next-prompt-debug.log)?",
+		current.debug === true,
+		"labels and sizes only, never transcript or suggestion text",
+		"no log file is written",
 	);
-	update.autoTrigger = autoPick;
+	if (debugPick !== undefined) update.debug = debugPick ? true : undefined;
+
+	// 11. autoTrigger: no = manual-only (the accept key doubles as the manual
+	// trigger), yes = settle-triggered suggestions.
+	const autoPick = await askYesNo(
+		"next-prompt: auto-trigger after each turn?",
+		current.autoTrigger ?? DEFAULT_AUTO_TRIGGER,
+		"suggest after every settled turn",
+		"manual only: press the accept key to generate, again to accept",
+	);
+	if (autoPick !== undefined) update.autoTrigger = autoPick;
 
 	return update;
 }

@@ -4499,9 +4499,14 @@ function makeConfigCtx(opts: {
 	return {
 		modelRegistry: { getAvailable: () => opts.models ?? [] },
 		ui: {
-			select: async (title: string, _options: string[]) => {
+			select: async (title: string, options: string[]) => {
 				calls.select.push(title);
-				return nextAnswer() as string | undefined;
+				const answer = nextAnswer();
+				// A boolean answers a yes/no picker: pick its "yes — …" or
+				// "no — …" option.
+				if (typeof answer === "boolean")
+					return options.find((o) => o.startsWith(answer ? "yes — " : "no — "));
+				return answer as string | undefined;
 			},
 			input: async (title: string, _placeholder?: string) => {
 				calls.input.push(title);
@@ -4543,8 +4548,9 @@ describe("configureInteractively", () => {
 			maxTranscriptChars: 8000,
 			maxRecentTurns: 12,
 			maxSuggestionChars: 200,
-			allowCrossProvider: false,
+			// allowCrossProvider: "no" equals the default, so it is not written.
 		});
+		expect(out !== undefined && "allowCrossProvider" in out).toBe(false);
 	});
 
 	test("T119b: opencode-go pick mints and stores a session id", async () => {
@@ -4651,7 +4657,7 @@ describe("configureInteractively", () => {
 		expect("maxRecentTurns" in (out ?? {})).toBe(false); // no cap saved → no-op
 	});
 
-	test("T122b: empty maxRecentTurns input DELETES the saved cap (Step 6)", async () => {
+	test("T122b: maxRecentTurns \"all\" DELETES the saved cap (Step 6)", async () => {
 		const ctx = makeConfigCtx({
 			answers: {
 				model: "(use current model)",
@@ -4660,15 +4666,14 @@ describe("configureInteractively", () => {
 				acceptKey: "alt+/",
 				rearmDelayMs: "2000",
 				maxTranscriptChars: "12000",
-				maxRecentTurns: "",
+				maxRecentTurns: "all",
 				maxSuggestionChars: "240",
 				allowCrossProvider: true,
 			},
 		});
 		const out = await configureInteractively(ctx, { maxRecentTurns: 4 });
 		// Explicit-undefined marker: saveConfig() drops the key, so the file
-		// returns to "all turns" — an empty input must clear the saved cap
-		// (the Step-0 footgun), not silently keep it.
+		// returns to "all turns".
 		expect(out).not.toBeUndefined();
 		expect("maxRecentTurns" in (out as object)).toBe(true);
 		expect(out?.maxRecentTurns).toBeUndefined();
@@ -4681,6 +4686,22 @@ describe("configureInteractively", () => {
 			),
 		) as Record<string, unknown>;
 		expect("maxRecentTurns" in onDisk).toBe(false);
+	});
+
+	test("T122c: an empty maxRecentTurns answer keeps the saved cap", async () => {
+		const ctx = makeConfigCtx({
+			answers: {
+				model: "(use current model)",
+				renderMode: "widget — colored line below the input box",
+				thinking: "(unset — model default)",
+				acceptKey: "",
+				rearmDelayMs: "",
+				maxTranscriptChars: "",
+				maxRecentTurns: "",
+			},
+		});
+		const out = await configureInteractively(ctx, { maxRecentTurns: 4 });
+		expect("maxRecentTurns" in (out ?? {})).toBe(false);
 	});
 
 	test("T123: invalid numeric input → field not set", async () => {
@@ -4705,34 +4726,111 @@ describe("configureInteractively", () => {
 	});
 });
 
-test("T124: renderMode picker lists ghost first with descriptions", async () => {
-	const seenRenderOptions: string[] = [];
+test("T124: the render-mode picker lists ghost first and opens on the saved mode", async () => {
+	const screens: string[][] = [];
+	const ctx = {
+		modelRegistry: { getAvailable: () => [] },
+		ui: {
+			select: async () => {
+				throw new Error("the TUI must use the picker");
+			},
+			input: async () => undefined,
+			custom: <T,>(factory: (...args: never[]) => unknown) =>
+				new Promise<T>((resolve) => {
+					const host = { terminal: { rows: 24 }, requestRender() {} };
+					const component = (
+						factory as unknown as (
+							h: typeof host,
+							t: { fg(c: string, s: string): string; bold(s: string): string },
+							k: unknown,
+							d: (v: T) => void,
+						) => { render(w: number): string[]; handleInput(d: string): void }
+					)(host, { fg: (_c, s) => s, bold: (s) => s }, {}, resolve);
+					const lines = component.render(100);
+					screens.push(lines);
+					// Accept the model step, cancel the render-mode step and the rest.
+					component.handleInput(screens.length === 1 ? "\r" : "\u001b");
+				}),
+		},
+	} as unknown as Parameters<typeof configureInteractively>[0];
+	await configureInteractively(ctx, { renderMode: "both" }, true);
+	const rows = screens[1]!.filter((line) => /^(→ | {2})\S/.test(line));
+	expect(rows[0]?.includes("ghost")).toBe(true);
+	expect(rows[1]?.includes("widget")).toBe(true);
+	expect(rows[2]).toBe("→ both — inline ghost AND the below-editor line ✓");
+});
+
+test("T124b: outside the TUI each choice lists its current value first", async () => {
+	const firstOptions: string[] = [];
 	const ctx = {
 		modelRegistry: { getAvailable: () => [] },
 		ui: {
 			select: async (_title: string, options: string[]) => {
-				// Capture render-mode options (those starting with ghost/widget/both).
-				if (
-					options.some(
-						(o) =>
-							o.startsWith("ghost") ||
-							o.startsWith("widget") ||
-							o.startsWith("both"),
-					)
-				) {
-					seenRenderOptions.push(...options);
-					return undefined; // cancel at render picker
-				}
-				return "(use current model)"; // proceed past model picker
+				firstOptions.push(options[0]!);
+				return options[0];
 			},
-			input: async () => undefined,
-			confirm: async () => false,
+			input: async () => "",
 		},
 	} as unknown as Parameters<typeof configureInteractively>[0];
-	await configureInteractively(ctx, {});
-	expect(seenRenderOptions[0]).toContain("ghost");
-	expect(seenRenderOptions.some((o) => o.startsWith("widget"))).toBe(true);
-	expect(seenRenderOptions.some((o) => o.startsWith("both"))).toBe(true);
+	await configureInteractively(ctx, {
+		renderMode: "both",
+		thinking: "high",
+		allowCrossProvider: true,
+		debug: true,
+		autoTrigger: false,
+	});
+	expect(firstOptions).toEqual([
+		"(use current model)",
+		"both — inline ghost AND the below-editor line",
+		"high",
+		"yes — use the configured model even on a different provider (per-project consent)",
+		"yes — labels and sizes only, never transcript or suggestion text",
+		"no — manual only: press the accept key to generate, again to accept",
+	]);
+});
+
+test("T124c: pressing Enter through every TUI dialog keeps the settings", async () => {
+	const current = {
+		model: { provider: "openai", model: "gpt-6-luna" },
+		renderMode: "both" as const,
+		thinking: "high" as const,
+		allowCrossProvider: true,
+		debug: true,
+		autoTrigger: false,
+	};
+	const ctx = {
+		modelRegistry: {
+			getAvailable: () => [
+				{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" },
+				{ provider: "openai", id: "gpt-6-luna", name: "GPT-6 Luna" },
+			],
+		},
+		ui: {
+			select: async () => {
+				throw new Error("the TUI must use the picker");
+			},
+			input: async () => "",
+			custom: <T,>(factory: (...args: never[]) => unknown) =>
+				new Promise<T>((resolve) => {
+					const host = { terminal: { rows: 24 }, requestRender() {} };
+					const component = (
+						factory as unknown as (
+							h: typeof host,
+							t: { fg(c: string, s: string): string; bold(s: string): string },
+							k: unknown,
+							d: (v: T) => void,
+						) => { handleInput(d: string): void }
+					)(host, { fg: (_c, s) => s, bold: (s) => s }, {}, resolve);
+					component.handleInput("\r");
+				}),
+		},
+	} as unknown as Parameters<typeof configureInteractively>[0];
+	const update = await configureInteractively(ctx, current, true);
+	// Only the model step writes, and it writes the saved model back. Every
+	// other step leaves its key out, so the file keeps exactly what it had.
+	const written = Object.entries(update ?? {}).filter(([, v]) => v !== undefined);
+	expect(written.map(([key]) => key)).toEqual(["model"]);
+	expect(update?.model).toEqual({ provider: "openai", model: "gpt-6-luna" });
 });
 
 // ---------------------------------------------------------------------------
@@ -6018,7 +6116,7 @@ describe("model picker", () => {
 		return { value: label, label };
 	});
 
-	function open(initialValue?: string, rows = 24) {
+	function open(initialValue?: string, rows = 24, search = true) {
 		const results: Array<string | undefined> = [];
 		const picker = createPicker(
 			"Pick a model",
@@ -6027,6 +6125,7 @@ describe("model picker", () => {
 			plainTheme,
 			() => rows,
 			(value) => results.push(value),
+			{ search },
 		);
 		const type = (...keys: string[]) =>
 			keys.forEach((key) => picker.handleInput(key));
@@ -6086,7 +6185,7 @@ describe("model picker", () => {
 		const empty = open();
 		empty.type("z", "z", "z", KEY_ENTER);
 		expect(empty.results.length).toBe(0);
-		expect(empty.picker.render(80)).toContain("  No matching models");
+		expect(empty.picker.render(80)).toContain("  No matches");
 	});
 
 	test("P5: pickItem draws the picker in the TUI and select elsewhere", async () => {
