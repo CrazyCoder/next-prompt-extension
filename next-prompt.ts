@@ -2701,12 +2701,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			ctx.ui.setEditorComponent?.(factory as never);
 			editorInstalled = true;
 			editorInstalledForHost = true;
-			if (prior && prior !== factory) {
-				ctx.ui.notify(
-					"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
-					"warning",
-				);
-			}
+			// Decorating a prior owner keeps its behavior, so there is nothing
+			// to tell the user; only a failed ghost (fallbackToWidget) notifies.
+			if (prior && prior !== factory) diag("editor_decorated");
 		} catch {
 			// Installation threw (e.g. the owner rejected replacement): keep
 			// widget mode, restore the prior owner, and let the suggestion

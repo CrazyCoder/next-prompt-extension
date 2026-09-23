@@ -2512,18 +2512,14 @@ describe("controller wiring (agent_settled)", () => {
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Ghost ownership re-established on top of the foreign owner (the
 		// historical working-with-powerline behavior): installed again, the
-		// foreign owner is NOT evicted/restored, the warning fires, and the
+		// foreign owner is NOT evicted/restored, nothing is notified, and the
 		// ghost repaints instead of any widget fallback.
 		expect(fake.editorComponentCalls).toBe(callsAfterForeign + 1);
 		expect(fake.lastEditorComponent === undefined).toBe(false);
 		expect(fake.editorComponentInstalled).toBe(true);
 		expect(fake.editorComponentRestores).toBe(restoresBefore);
 		expect(fake.requestRenderCalls).toBeGreaterThan(0);
-		expect(
-			fake.calls.notifies.some(([m]) =>
-				m.includes("another extension owns the editor"),
-			),
-		).toBe(true);
+		expect(fake.calls.notifies).toHaveLength(0);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
@@ -3647,15 +3643,8 @@ describe("renderMode config", () => {
 		});
 		// Ghost is attempted despite the prior owner.
 		expect(fake.editorComponentInstalled).toBe(true);
-		// Warning explains the ownership + the conditional fallback.
-		expect(
-			fake.calls.notifies.some(
-				([m, t]) =>
-					t === "warning" &&
-					m.includes("another extension owns the editor") &&
-					m.includes("falling back to widget only if ghost rendering fails"),
-			),
-		).toBe(true);
+		// Decorating the prior owner is silent: no notification at all.
+		expect(fake.calls.notifies).toHaveLength(0);
 		// No fallback fired: the prior editor is NOT restored, ghost stays active.
 		expect(fake.editorComponentRestores).toBe(0);
 		// Suggestion renders via the ghost, not the widget (P1-1: still renders).
